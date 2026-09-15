@@ -48,3 +48,4 @@ desktop.ini
 *.log
 *.tmp
 .cache/
+./Moge_CLI
