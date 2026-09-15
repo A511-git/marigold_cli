@@ -125,28 +125,44 @@ class MarigoldV2InferenceEngine:
 
         # 2. Configure native subfolder paths for Diffusers (loads VAE & Transformer directly without full repo clone)
         is_local_base = os.path.isdir(self.base_model)
-        vae_source = str(Path(self.base_model) / "vae") if is_local_base else self.base_model
-        vae_subfolder = None if is_local_base else "vae"
+        
+        # 3. Load VAE directly (downloads only ~330MB VAE weights)
+        print(f"[Marigold V2] 🧠 Loading Qwen VAE...")
+        vae_loaded = False
+        vae_candidates = []
+        if is_local_base:
+            if (Path(self.base_model) / "vae").is_dir():
+                vae_candidates.append((str(Path(self.base_model) / "vae"), None))
+            else:
+                vae_candidates.append((self.base_model, None))
+        else:
+            vae_candidates.append((self.base_model, "vae"))
+        # Fallback to official Qwen VAE if base_model only contains transformer weights
+        vae_candidates.append(("Qwen/Qwen-Image-Edit-2509", "vae"))
 
-        transformer_source = str(Path(self.base_model) / "transformer") if is_local_base else self.base_model
-        transformer_subfolder = None if is_local_base else "transformer"
+        for vae_src, vae_sub in vae_candidates:
+            try:
+                vae_kwargs = dict(
+                    pretrained_model_name_or_path=vae_src,
+                    torch_dtype=self.dtype,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                )
+                if vae_sub:
+                    vae_kwargs["subfolder"] = vae_sub
+                self.vae = AutoencoderKLQwenImage.from_pretrained(**vae_kwargs).to(self.device).eval()
+                self.vae.requires_grad_(False)
+                vae_loaded = True
+                print(f"[Marigold V2] ✅ Loaded VAE from '{vae_src}' (subfolder: {vae_sub})")
+                break
+            except Exception as e:
+                continue
 
-        # 3. Load VAE directly via Diffusers subfolder (downloads only ~330MB VAE weights)
-        print(f"[Marigold V2] 🧠 Loading Qwen VAE from '{self.base_model}' (subfolder: vae)...")
-        vae_kwargs = dict(
-            pretrained_model_name_or_path=vae_source,
-            torch_dtype=self.dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True
-        )
-        if vae_subfolder:
-            vae_kwargs["subfolder"] = vae_subfolder
+        if not vae_loaded or self.vae is None:
+            raise RuntimeError(f"Failed to load AutoencoderKLQwenImage VAE from candidates: {vae_candidates}")
 
-        self.vae = AutoencoderKLQwenImage.from_pretrained(**vae_kwargs).to(self.device).eval()
-        self.vae.requires_grad_(False)
-
-        # 4. Load DiT Transformer directly via Diffusers subfolder with 4-bit / 8-bit quantization
-        print(f"[Marigold V2] 🧠 Loading Qwen DiT Transformer (quantization: {self.quantization})...")
+        # 4. Load DiT Transformer with official 4-bit NF4 quantization or pre-compiled weights
+        print(f"[Marigold V2] 🧠 Loading Qwen DiT Transformer (model: '{self.base_model}', quant: {self.quantization})...")
         quant_config = None
         if self.quantization == "4bit" and self.device.type == "cuda":
             quant_config = DiffusersBitsAndBytesConfig(
@@ -161,17 +177,55 @@ class MarigoldV2InferenceEngine:
                 llm_int8_skip_modules=["transformer_blocks.0.img_mod"]
             )
 
-        transformer_kwargs = dict(
-            pretrained_model_name_or_path=transformer_source,
-            quantization_config=quant_config,
-            torch_dtype=self.dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True
-        )
-        if transformer_subfolder:
-            transformer_kwargs["subfolder"] = transformer_subfolder
+        transformer_candidates = []
+        if is_local_base:
+            if (Path(self.base_model) / "transformer").is_dir():
+                transformer_candidates.append((str(Path(self.base_model) / "transformer"), None))
+            transformer_candidates.append((self.base_model, None))
+        else:
+            transformer_candidates.append((self.base_model, "transformer"))
+            transformer_candidates.append((self.base_model, None))
 
-        self.transformer = QwenImageTransformer2DModel.from_pretrained(**transformer_kwargs)
+        transformer_loaded = False
+        for tf_src, tf_sub in transformer_candidates:
+            try:
+                transformer_kwargs = dict(
+                    pretrained_model_name_or_path=tf_src,
+                    torch_dtype=self.dtype,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                )
+                if tf_sub:
+                    transformer_kwargs["subfolder"] = tf_sub
+                if quant_config is not None:
+                    transformer_kwargs["quantization_config"] = quant_config
+
+                self.transformer = QwenImageTransformer2DModel.from_pretrained(**transformer_kwargs)
+                transformer_loaded = True
+                print(f"[Marigold V2] ✅ Loaded Transformer from '{tf_src}' (subfolder: {tf_sub})")
+                break
+            except Exception as e:
+                # If loading with quantization_config fails because model is already pre-quantized, try without config
+                if quant_config is not None:
+                    try:
+                        transformer_kwargs_no_q = dict(
+                            pretrained_model_name_or_path=tf_src,
+                            torch_dtype=self.dtype,
+                            low_cpu_mem_usage=True,
+                            use_safetensors=True
+                        )
+                        if tf_sub:
+                            transformer_kwargs_no_q["subfolder"] = tf_sub
+                        self.transformer = QwenImageTransformer2DModel.from_pretrained(**transformer_kwargs_no_q)
+                        transformer_loaded = True
+                        print(f"[Marigold V2] ✅ Loaded pre-quantized Transformer from '{tf_src}' (subfolder: {tf_sub})")
+                        break
+                    except Exception:
+                        pass
+                continue
+
+        if not transformer_loaded or self.transformer is None:
+            raise RuntimeError(f"Failed to load QwenImageTransformer2DModel from candidates: {transformer_candidates}")
 
         # 5. Load Marigold V2 LoRA & VAE trainables
         trainables_candidates = [
