@@ -94,7 +94,7 @@ class MarigoldV2InferenceEngine:
     def _load_models(self):
         print(f"\n[Marigold V2] 🚀 Initializing Marigold V2 ({self.modality.upper()}) on {self.device} (dtype: {self.dtype}, quant: {self.quantization})...")
         
-        # 1. Resolve targeted Marigold V2 LoRA subfolder for current modality
+        # 1. Resolve targeted Marigold V2 LoRA subfolder for current modality (3 files only)
         modality_subdirs = {
             "depth": "depth/Log-stage2",
             "depth-stage1": "depth/Log",
@@ -123,31 +123,29 @@ class MarigoldV2InferenceEngine:
             ignore_patterns=["evaluation/*", "data_split/*", "src/*", "depth/Disp*", "depth/Log/*", "normals/*", "albedo/*"] if self.modality == "depth" else None
         )
 
-        # 2. Download ONLY VAE and Transformer from base Qwen DiT (ignores 40GB+ text encoders & tokenizers)
-        qwen_patterns = [
-            "vae/*.safetensors",
-            "vae/*.json",
-            "transformer/*.safetensors",
-            "transformer/*.json",
-            "model_index.json"
-        ]
-        qwen_dir = self._resolve_path_or_download(
-            self.base_model,
-            allow_patterns=qwen_patterns,
-            ignore_patterns=["text_encoder/**", "text_encoder_2/**", "tokenizer/**", "*.bin", "*.pt", "*.msgpack", "*.onnx", "scheduler/**", "feature_extractor/**"]
-        )
+        # 2. Configure native subfolder paths for Diffusers (loads VAE & Transformer directly without full repo clone)
+        is_local_base = os.path.isdir(self.base_model)
+        vae_source = str(Path(self.base_model) / "vae") if is_local_base else self.base_model
+        vae_subfolder = None if is_local_base else "vae"
 
-        # 3. Load VAE
-        print(f"[Marigold V2] 🧠 Loading Qwen VAE from {qwen_dir / 'vae'}...")
-        self.vae = AutoencoderKLQwenImage.from_pretrained(
-            qwen_dir / "vae",
+        transformer_source = str(Path(self.base_model) / "transformer") if is_local_base else self.base_model
+        transformer_subfolder = None if is_local_base else "transformer"
+
+        # 3. Load VAE directly via Diffusers subfolder (downloads only ~330MB VAE weights)
+        print(f"[Marigold V2] 🧠 Loading Qwen VAE from '{self.base_model}' (subfolder: vae)...")
+        vae_kwargs = dict(
+            pretrained_model_name_or_path=vae_source,
             torch_dtype=self.dtype,
             low_cpu_mem_usage=True,
             use_safetensors=True
-        ).to(self.device).eval()
+        )
+        if vae_subfolder:
+            vae_kwargs["subfolder"] = vae_subfolder
+
+        self.vae = AutoencoderKLQwenImage.from_pretrained(**vae_kwargs).to(self.device).eval()
         self.vae.requires_grad_(False)
 
-        # 4. Load DiT Transformer with requested quantization (4-bit / 8-bit / full precision)
+        # 4. Load DiT Transformer directly via Diffusers subfolder with 4-bit / 8-bit quantization
         print(f"[Marigold V2] 🧠 Loading Qwen DiT Transformer (quantization: {self.quantization})...")
         quant_config = None
         if self.quantization == "4bit" and self.device.type == "cuda":
@@ -163,13 +161,17 @@ class MarigoldV2InferenceEngine:
                 llm_int8_skip_modules=["transformer_blocks.0.img_mod"]
             )
 
-        self.transformer = QwenImageTransformer2DModel.from_pretrained(
-            qwen_dir / "transformer",
+        transformer_kwargs = dict(
+            pretrained_model_name_or_path=transformer_source,
             quantization_config=quant_config,
             torch_dtype=self.dtype,
             low_cpu_mem_usage=True,
             use_safetensors=True
         )
+        if transformer_subfolder:
+            transformer_kwargs["subfolder"] = transformer_subfolder
+
+        self.transformer = QwenImageTransformer2DModel.from_pretrained(**transformer_kwargs)
 
         # 5. Load Marigold V2 LoRA & VAE trainables
         trainables_candidates = [
