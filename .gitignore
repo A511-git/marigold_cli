@@ -47,5 +47,4 @@ desktop.ini
 # Logs & Temporary Files
 *.log
 *.tmp
-.cache/
-./Moge_CLI
+Moge_CLI/

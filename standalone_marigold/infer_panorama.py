@@ -76,17 +76,53 @@ except ImportError:
 
 
 CHECKPOINT_ALIASES = {
-    "prs-eth/marigold-v2-0": "prs-eth/marigold-depth-v1-1",
-    "huawei-bayerlab/marigold-v2-0": "prs-eth/marigold-depth-v1-1",
-    "marigold-v2-0": "prs-eth/marigold-depth-v1-1",
-    "marigold-v2": "prs-eth/marigold-depth-v1-1",
+    "prs-eth/marigold-v2-0": "huawei-bayerlab/marigold-v2-0",
+    "huawei-bayerlab/marigold-v2-0": "huawei-bayerlab/marigold-v2-0",
+    "marigold-v2-0": "huawei-bayerlab/marigold-v2-0",
+    "marigold-v2": "huawei-bayerlab/marigold-v2-0",
+    "v2": "huawei-bayerlab/marigold-v2-0",
     "marigold-depth-v1-1": "prs-eth/marigold-depth-v1-1",
     "marigold-depth": "prs-eth/marigold-depth-v1-1",
     "marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
     "marigold-depth-lcm": "prs-eth/marigold-depth-lcm-v1-0",
     "prs-eth/marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
-    "default": "prs-eth/marigold-depth-v1-1",
+    "default": "huawei-bayerlab/marigold-v2-0",
 }
+
+
+def create_inference_engine(
+    checkpoint: str = "huawei-bayerlab/marigold-v2-0",
+    device: str = "cuda",
+    use_fp16: bool = True,
+    use_diffusers: bool = True,
+    quantization: str = "4bit"
+):
+    resolved = CHECKPOINT_ALIASES.get(checkpoint, checkpoint)
+    if "v2" in resolved.lower() or "huawei" in resolved.lower():
+        try:
+            from standalone_marigold.v2_engine import MarigoldV2InferenceEngine
+            return MarigoldV2InferenceEngine(
+                checkpoint=resolved,
+                modality="depth",
+                device=device,
+                quantization=quantization,
+                use_fp16=use_fp16
+            )
+        except Exception as e:
+            print(f"[Warning] Notice loading Marigold V2 DiT engine: {e}. Falling back to Marigold V1.1 Diffusers engine...")
+            return MarigoldInferenceEngine(
+                checkpoint="prs-eth/marigold-depth-v1-1",
+                device=device,
+                use_fp16=use_fp16,
+                use_diffusers=use_diffusers
+            )
+    else:
+        return MarigoldInferenceEngine(
+            checkpoint=resolved,
+            device=device,
+            use_fp16=use_fp16,
+            use_diffusers=use_diffusers
+        )
 
 
 class MarigoldInferenceEngine:
@@ -112,7 +148,7 @@ class MarigoldInferenceEngine:
         self._init_pipeline()
 
     def _init_pipeline(self):
-        print(f"\n[Marigold V2] 🚀 Loading '{self.checkpoint}' onto {self.device} (dtype: {self.dtype})...")
+        print(f"\n[Marigold V1.1] 🚀 Loading '{self.checkpoint}' onto {self.device} (dtype: {self.dtype})...")
         try:
             from diffusers import MarigoldDepthPipeline
             self.pipeline = MarigoldDepthPipeline.from_pretrained(
@@ -126,12 +162,12 @@ class MarigoldInferenceEngine:
             if self.device.type == "cuda":
                 alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
                 res_mb = torch.cuda.memory_reserved(self.device) / (1024 ** 2)
-                print(f"[Marigold V2] ✅ Model active in VRAM on {self.device} (Allocated: {alloc_mb:.1f} MB | Reserved: {res_mb:.1f} MB)")
+                print(f"[Marigold V1.1] ✅ Model active in VRAM on {self.device} (Allocated: {alloc_mb:.1f} MB | Reserved: {res_mb:.1f} MB)")
             else:
-                print(f"[Marigold V2] ✅ Model loaded on CPU.")
+                print(f"[Marigold V1.1] ✅ Model loaded on CPU.")
             return
         except Exception as e:
-            print(f"[Marigold V2] Diffusers native load notice: {e}. Attempting diffusion pipeline auto-loader...")
+            print(f"[Marigold V1.1] Diffusers native load notice: {e}. Attempting diffusion pipeline auto-loader...")
             try:
                 from diffusers import DiffusionPipeline
                 self.pipeline = DiffusionPipeline.from_pretrained(
@@ -144,11 +180,11 @@ class MarigoldInferenceEngine:
                     self.pipeline.set_progress_bar_config(disable=True)
                 if self.device.type == "cuda":
                     alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
-                    print(f"[Marigold V2] ✅ Model active in VRAM on {self.device} ({alloc_mb:.1f} MB)")
+                    print(f"[Marigold V1.1] ✅ Model active in VRAM on {self.device} ({alloc_mb:.1f} MB)")
                 return
             except Exception as e2:
-                print(f"[Marigold V2] ❌ Fatal: Failed to load Marigold V2 into VRAM: {e2}")
-                raise RuntimeError(f"Could not load Marigold V2 checkpoint '{self.checkpoint}' on {self.device}: {e2}")
+                print(f"[Marigold V1.1] ❌ Fatal: Failed to load Marigold into VRAM: {e2}")
+                raise RuntimeError(f"Could not load Marigold checkpoint '{self.checkpoint}' on {self.device}: {e2}")
 
     def predict_depth_batch(self, images_bgr: List[np.ndarray], batch_size: int = 4) -> List[np.ndarray]:
         """
@@ -159,34 +195,24 @@ class MarigoldInferenceEngine:
 
         depths = []
         num_steps = 1 if "lcm" in self.checkpoint.lower() else 4
-        bs = max(1, batch_size)
 
-        for i in range(0, len(pil_images), bs):
-            batch = pil_images[i : i + bs]
-            with torch.inference_mode():
-                out = self.pipeline(
-                    batch if len(batch) > 1 else batch[0],
-                    num_inference_steps=num_steps,
-                    ensemble_size=1
-                )
-
-            if hasattr(out, "depth_np"):
-                d_np = out.depth_np
-                if d_np.ndim == 2:
-                    depths.append(d_np.astype(np.float32))
-                else:
-                    for d in d_np:
-                        depths.append(d.squeeze().astype(np.float32))
-            elif hasattr(out, "prediction"):
-                pred = out.prediction
-                if isinstance(pred, torch.Tensor):
-                    pred = pred.cpu().numpy()
-                if pred.ndim == 2:
-                    depths.append(pred.astype(np.float32))
-                else:
-                    for d in pred:
-                        depths.append(d.squeeze().astype(np.float32))
-            else:
+        for i in range(0, len(pil_images), batch_size):
+            batch = pil_images[i:i + batch_size]
+            try:
+                with torch.inference_mode():
+                    pipe_out = self.pipeline(
+                        batch,
+                        denoising_steps=num_steps,
+                        ensemble_size=1,
+                        output_type="np",
+                        show_progress_bar=False
+                    )
+                    prediction = pipe_out.prediction
+                    if prediction.ndim == 4:
+                        prediction = prediction.squeeze(1)
+                    for b_idx in range(len(batch)):
+                        depths.append(prediction[b_idx].astype(np.float32))
+            except Exception:
                 for b in batch:
                     depths.append(self.predict_depth_tile(cv2.cvtColor(np.array(b), cv2.COLOR_RGB2BGR)))
 
@@ -195,16 +221,166 @@ class MarigoldInferenceEngine:
     def predict_depth_tile(self, image_bgr: np.ndarray) -> np.ndarray:
         """
         Runs Marigold depth estimation on a single perspective tile.
-        Returns:
-            2D numpy array [H, W] float32 relative depth.
         """
         return self.predict_depth_batch([image_bgr], batch_size=1)[0]
+
+
+def process_single_panorama(
+    engine: Union[MarigoldInferenceEngine, Any],
+    image_path: Union[str, Path],
+    save_path: Union[str, Path],
+    split_resolution: int = 512,
+    batch_size: int = 1,
+    resize_to: Optional[int] = None,
+    save_maps_: bool = True,
+    save_depth_npy: bool = True,
+    save_points_ply: bool = True,
+    save_debug: bool = False
+) -> Dict[str, Any]:
+    """
+    Processes a single 360 panorama image using an already-loaded in-memory MarigoldInferenceEngine.
+    """
+    image_path = Path(image_path)
+    save_path = Path(save_path)
+    save_path.mkdir(exist_ok=True, parents=True)
+
+    image_bgr = cv2.imread(str(image_path))
+    if image_bgr is None:
+        raise ValueError(f"Failed to load image from: {image_path}")
+
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    orig_height, orig_width = image_rgb.shape[:2]
+    image = image_rgb.copy()
+
+    # Handle optional resize
+    target_height, target_width = orig_height, orig_width
+    if resize_to is not None and (orig_height > resize_to or orig_width > resize_to):
+        target_height = min(resize_to, int(resize_to * orig_height / orig_width))
+        target_width = min(resize_to, int(resize_to * orig_width / orig_height))
+        image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+    # 1. Split equirectangular panorama into perspective views using icosahedron
+    t0 = time.time()
+    splitted_extrinsics, splitted_intrinsics = get_panorama_cameras()
+    splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intrinsics, split_resolution)
+    t1 = time.time()
+
+    # 2. Batched GPU inference on 12 perspective views
+    splitted_images_bgr = [cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in splitted_images]
+    splitted_depth_maps = engine.predict_depth_batch(splitted_images_bgr, batch_size=batch_size)
+
+    splitted_distance_maps = []
+    splitted_masks = []
+
+    for i in range(len(splitted_depth_maps)):
+        tile_depth = splitted_depth_maps[i]
+        h, w = tile_depth.shape[:2]
+        intr = splitted_intrinsics[i]
+        fx, fy = intr[0, 0] * w, intr[1, 1] * h
+        cx, cy = intr[0, 2] * w, intr[1, 2] * h
+
+        u_coords = np.arange(w, dtype=np.float32) + 0.5
+        v_coords = np.arange(h, dtype=np.float32) + 0.5
+        u_grid, v_grid = np.meshgrid(u_coords, v_coords)
+
+        ray_scale = np.sqrt(1.0 + ((u_grid - cx) / fx)**2 + ((v_grid - cy) / fy)**2)
+        dist_map = (tile_depth * ray_scale).astype(np.float32)
+        mask = np.isfinite(dist_map) & (dist_map > 0)
+
+        splitted_distance_maps.append(dist_map)
+        splitted_masks.append(mask)
+
+    t2 = time.time()
+
+    # Save debug artifacts if requested
+    if save_debug:
+        splitted_dir = save_path / 'splitted'
+        splitted_dir.mkdir(exist_ok=True, parents=True)
+        cameras_meta = []
+
+        for i in range(len(splitted_images)):
+            cv2.imwrite(str(splitted_dir / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(splitted_dir / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
+            save_exr_safely(splitted_dir / f'{i:02d}_depth.exr', splitted_depth_maps[i])
+            cv2.imwrite(str(splitted_dir / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+            save_exr_safely(splitted_dir / f'{i:02d}_distance.exr', splitted_distance_maps[i])
+            cv2.imwrite(str(splitted_dir / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+
+            fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intrinsics[i]))
+            cam_info = {
+                'index': i,
+                'image': f'{i:02d}.jpg',
+                'fov_x': round(float(fov_xi), 2),
+                'fov_y': round(float(fov_yi), 2),
+                'intrinsics': splitted_intrinsics[i].tolist(),
+                'extrinsics': splitted_extrinsics[i].tolist(),
+            }
+            cameras_meta.append(cam_info)
+
+            with open(splitted_dir / f'{i:02d}_camera.json', 'w') as f:
+                json.dump(cam_info, f, indent=2)
+
+        with open(splitted_dir / 'cameras.json', 'w') as f:
+            json.dump({'views': cameras_meta}, f, indent=2)
+
+    # 3. Merge panoramic depth using GPU Poisson solver (0% CPU lock, ~30ms runtime)
+    t3 = time.time()
+    merging_width, merging_height = min(1920, target_width), min(960, target_height)
+    panorama_depth, panorama_mask = merge_panorama_depth(
+        merging_width,
+        merging_height,
+        splitted_distance_maps,
+        splitted_masks,
+        splitted_extrinsics,
+        splitted_intrinsics,
+        device=engine.device
+    )
+
+    if panorama_depth.shape[:2] != (target_height, target_width):
+        panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+        panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
+
+    t4 = time.time()
+
+    # 4. Save primary and optional outputs
+    if save_depth_npy:
+        np.save(str(save_path / 'depth.npy'), panorama_depth.astype(np.float32))
+
+    if save_maps_:
+        cv2.imwrite(str(save_path / 'depth_vis.png'), cv2.cvtColor(colorize_depth(panorama_depth, panorama_mask), cv2.COLOR_RGB2BGR))
+        save_exr_safely(save_path / 'depth.exr', panorama_depth)
+        cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
+
+    if save_points_ply:
+        uv = utils3d.np.uv_map(target_height, target_width)
+        ray_dirs = spherical_uv_to_directions(uv)
+        points_3d = ray_dirs * panorama_depth[..., None]
+        pts = points_3d.reshape(-1, 3)
+        cols = image.reshape(-1, 3)
+        m = panorama_mask.reshape(-1) > 0
+        pts, cols = pts[m], cols[m]
+        
+        with open(save_path / 'pointcloud.ply', 'w') as f:
+            f.write(f"ply\nformat ascii 1.0\nelement vertex {len(pts)}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+            for p, c in zip(pts, cols):
+                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
+    return {
+        'depth': panorama_depth,
+        'mask': panorama_mask,
+        'timings': {
+            'split': t1 - t0,
+            'inference': t2 - t1,
+            'merge': t4 - t3,
+            'total': t4 - t0
+        }
+    }
 
 
 @click.command(help='Standalone Marigold-360 Panorama Inference CLI (Docker / Direct CLI)')
 @click.option('--input', '-i', 'input_path', type=click.Path(exists=True), required=True, help='Input panorama image or folder path (JPG/PNG/WEBP). [REQUIRED via CLI]')
 @click.option('--output', '-o', 'output_path', type=click.Path(), envvar='MARIGOLD_OUTPUT', default='./output', show_default=True, help='Output directory for generated artifacts. [env: MARIGOLD_OUTPUT]')
-@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='prs-eth/marigold-depth-v1-1', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
+@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='huawei-bayerlab/marigold-v2-0', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
 @click.option('--device', 'device_name', type=str, envvar='MARIGOLD_DEVICE', default='cuda', show_default=True, help='Device (e.g. "cuda", "cuda:0", "cpu"). [env: MARIGOLD_DEVICE]')
 @click.option('--fp16', 'use_fp16', is_flag=True, envvar='MARIGOLD_FP16', default=True, help='Use FP16 precision for faster inference. [env: MARIGOLD_FP16]')
 @click.option('--diffusers', 'use_diffusers', is_flag=True, envvar='MARIGOLD_DIFFUSERS', default=True, help='Use Hugging Face Diffusers backend. [env: MARIGOLD_DIFFUSERS]')
@@ -260,8 +436,8 @@ def main(
     print(f" Debug Tiles:        {save_debug}")
     print("=" * 70 + "\n")
 
-    # Initialize Engine
-    engine = MarigoldInferenceEngine(
+    # Initialize Engine (Auto-routes between V2 DiT and V1.1 Diffusers)
+    engine = create_inference_engine(
         checkpoint=checkpoint_path,
         device=device_name,
         use_fp16=use_fp16,
@@ -269,144 +445,33 @@ def main(
     )
 
     for idx, image_path in enumerate(image_paths, start=1):
-        image_bgr = cv2.imread(str(image_path))
-        if image_bgr is None:
-            print(f"[Warning] Failed to load image {image_path}, skipping...")
-            continue
-
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        orig_height, orig_width = image_rgb.shape[:2]
-        image = image_rgb.copy()
-
-        # Handle optional resize
-        target_height, target_width = orig_height, orig_width
-        if resize_to is not None and (orig_height > resize_to or orig_width > resize_to):
-            target_height = min(resize_to, int(resize_to * orig_height / orig_width))
-            target_width = min(resize_to, int(resize_to * orig_width / orig_height))
-            image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
-
-        # Output folder per image
         if input_p.is_dir():
             rel_parent = image_path.relative_to(input_p).parent
             save_path = Path(output_path, rel_parent, image_path.stem)
         else:
             save_path = Path(output_path, image_path.stem)
 
-        save_path.mkdir(exist_ok=True, parents=True)
-
-        # 1. Split equirectangular panorama into perspective views using icosahedron
-        t0 = time.time()
-        splitted_extrinsics, splitted_intrinsics = get_panorama_cameras()
-        splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intrinsics, split_resolution)
-        t1 = time.time()
-        print(f"[{idx}/{len(image_paths)}] Split 12 perspective views: {t1 - t0:.3f}s")
-
-        # 2. Batched GPU inference on 12 perspective views
-        splitted_images_bgr = [cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in splitted_images]
-        splitted_depth_maps = engine.predict_depth_batch(splitted_images_bgr, batch_size=batch_size)
-
-        splitted_distance_maps = []
-        splitted_masks = []
-
-        for i in range(len(splitted_depth_maps)):
-            tile_depth = splitted_depth_maps[i]
-            h, w = tile_depth.shape[:2]
-            intr = splitted_intrinsics[i]
-            fx, fy = intr[0, 0] * w, intr[1, 1] * h
-            cx, cy = intr[0, 2] * w, intr[1, 2] * h
-
-            u_coords = np.arange(w, dtype=np.float32) + 0.5
-            v_coords = np.arange(h, dtype=np.float32) + 0.5
-            u_grid, v_grid = np.meshgrid(u_coords, v_coords)
-
-            ray_scale = np.sqrt(1.0 + ((u_grid - cx) / fx)**2 + ((v_grid - cy) / fy)**2)
-            dist_map = (tile_depth * ray_scale).astype(np.float32)
-            mask = np.isfinite(dist_map) & (dist_map > 0)
-
-            splitted_distance_maps.append(dist_map)
-            splitted_masks.append(mask)
-
-        t2 = time.time()
-        print(f"[{idx}/{len(image_paths)}] GPU Marigold inference: {t2 - t1:.3f}s")
-
-        # Save debug artifacts if requested
-        if save_debug:
-            splitted_dir = save_path / 'splitted'
-            splitted_dir.mkdir(exist_ok=True, parents=True)
-            cameras_meta = []
-
-            for i in range(len(splitted_images)):
-                cv2.imwrite(str(splitted_dir / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
-                save_exr_safely(splitted_dir / f'{i:02d}_depth.exr', splitted_depth_maps[i])
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                save_exr_safely(splitted_dir / f'{i:02d}_distance.exr', splitted_distance_maps[i])
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-
-                fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intrinsics[i]))
-                cam_info = {
-                    'index': i,
-                    'image': f'{i:02d}.jpg',
-                    'fov_x': round(float(fov_xi), 2),
-                    'fov_y': round(float(fov_yi), 2),
-                    'intrinsics': splitted_intrinsics[i].tolist(),
-                    'extrinsics': splitted_extrinsics[i].tolist(),
-                }
-                cameras_meta.append(cam_info)
-
-                with open(splitted_dir / f'{i:02d}_camera.json', 'w') as f:
-                    json.dump(cam_info, f, indent=2)
-
-            with open(splitted_dir / 'cameras.json', 'w') as f:
-                json.dump({'views': cameras_meta}, f, indent=2)
-
-        # 3. Merge panoramic depth using GPU Poisson solver (0% CPU lock, ~30ms runtime)
-        t3 = time.time()
-        merging_width, merging_height = min(1920, target_width), min(960, target_height)
-        panorama_depth, panorama_mask = merge_panorama_depth(
-            merging_width,
-            merging_height,
-            splitted_distance_maps,
-            splitted_masks,
-            splitted_extrinsics,
-            splitted_intrinsics,
-            device=engine.device
-        )
-
-        if panorama_depth.shape[:2] != (target_height, target_width):
-            panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-            panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
-
-        t4 = time.time()
-        print(f"[{idx}/{len(image_paths)}] Poisson 360° merge: {t4 - t3:.3f}s")
-
-        # 4. Save primary and optional outputs
-        if save_depth_npy:
-            np.save(str(save_path / 'depth.npy'), panorama_depth.astype(np.float32))
-
-        if save_maps_:
-            cv2.imwrite(str(save_path / 'depth_vis.png'), cv2.cvtColor(colorize_depth(panorama_depth, panorama_mask), cv2.COLOR_RGB2BGR))
-            save_exr_safely(save_path / 'depth.exr', panorama_depth)
-            cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
-
-        if save_points_ply:
-            uv = utils3d.np.uv_map(target_height, target_width)
-            ray_dirs = spherical_uv_to_directions(uv)
-            points_3d = ray_dirs * panorama_depth[..., None]
-            pts = points_3d.reshape(-1, 3)
-            cols = image.reshape(-1, 3)
-            m = panorama_mask.reshape(-1) > 0
-            pts, cols = pts[m], cols[m]
-            
-            with open(save_path / 'pointcloud.ply', 'w') as f:
-                f.write(f"ply\nformat ascii 1.0\nelement vertex {len(pts)}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
-                for p, c in zip(pts, cols):
-                    f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
-
-        print(f"[{idx}/{len(image_paths)}] Done in {t4 - t0:.2f}s -> {save_path}\n")
+        print(f"[{idx}/{len(image_paths)}] Processing: {image_path.name}...")
+        try:
+            res = process_single_panorama(
+                engine=engine,
+                image_path=image_path,
+                save_path=save_path,
+                split_resolution=split_resolution,
+                batch_size=batch_size,
+                resize_to=resize_to,
+                save_maps_=save_maps_,
+                save_depth_npy=save_depth_npy,
+                save_points_ply=save_points_ply,
+                save_debug=save_debug
+            )
+            print(f"[{idx}/{len(image_paths)}] ✅ Done in {res['timings']['total']:.2f}s (Split: {res['timings']['split']:.2f}s | Infer: {res['timings']['inference']:.2f}s | Merge: {res['timings']['merge']:.3f}s) -> {save_path}\n")
+        except Exception as e:
+            print(f"[{idx}/{len(image_paths)}] ❌ Failed {image_path.name}: {e}\n")
 
     print("✨ All panoramas processed successfully!")
 
 
 if __name__ == '__main__':
     main()
+
