@@ -268,6 +268,18 @@ class MarigoldV2InferenceEngine:
         if embeds_file.is_file() and mask_file.is_file():
             self.prompt_embeds = torch.load(str(embeds_file), map_location="cpu", weights_only=False)
             self.prompt_mask = torch.load(str(mask_file), map_location="cpu", weights_only=False)
+            
+            # Ensure singleton batch dimension [1, seq_len, dim]
+            if self.prompt_embeds.ndim == 2:
+                self.prompt_embeds = self.prompt_embeds.unsqueeze(0)
+            elif self.prompt_embeds.ndim == 3 and self.prompt_embeds.shape[0] > 1:
+                self.prompt_embeds = self.prompt_embeds[0:1]
+
+            if self.prompt_mask.ndim == 1:
+                self.prompt_mask = self.prompt_mask.unsqueeze(0)
+            elif self.prompt_mask.ndim == 2 and self.prompt_mask.shape[0] > 1:
+                self.prompt_mask = self.prompt_mask[0:1]
+
             if self.prompt_mask.dtype != torch.bool:
                 self.prompt_mask = self.prompt_mask > 0
         else:
@@ -313,8 +325,8 @@ class MarigoldV2InferenceEngine:
 
             # 3. DiT Single Step at t = 0.499
             timestep = torch.full((B,), 499.0, device=self.device, dtype=self.dtype) / 1000.0
-            p_embeds = self.prompt_embeds.expand(B, *self.prompt_embeds.shape[1:]).to(self.device, dtype=self.dtype)
-            p_mask = self.prompt_mask.expand(B, *self.prompt_mask.shape[1:]).to(self.device, dtype=torch.bool)
+            p_embeds = self.prompt_embeds[:1].repeat(B, 1, 1).to(self.device, dtype=self.dtype)
+            p_mask = self.prompt_mask[:1].repeat(B, 1).to(self.device, dtype=torch.bool)
             img_shapes = [[(1, lat.shape[2] // 2, lat.shape[3] // 2)]] * B
             txt_seq_lens = p_mask.sum(dim=1).tolist()
 
