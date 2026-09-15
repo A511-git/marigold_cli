@@ -34,7 +34,7 @@ def _latent_stats(vae, ref):
 class MarigoldV2InferenceEngine:
     """
     Official Marigold V2 Diffusion Transformer (DiT) Inference Engine.
-    Downloads ONLY the lightweight modality LoRA weights and DiT backbone slices.
+    Strictly downloads ONLY the requested single-modality LoRA files and DiT backbone weights.
     """
     def __init__(
         self,
@@ -80,7 +80,7 @@ class MarigoldV2InferenceEngine:
             print(f"[Marigold V2] 📂 Found local model path: {p.resolve()}")
             return p.resolve()
 
-        print(f"[Marigold V2] 🌐 Checking / Downloading targeted weights from: '{repo_or_path}'...")
+        print(f"[Marigold V2] 🌐 Downloading minimal required weights from: '{repo_or_path}'...")
         kwargs = {"repo_id": repo_or_path, "repo_type": "model"}
         if allow_patterns:
             kwargs["allow_patterns"] = allow_patterns
@@ -88,7 +88,7 @@ class MarigoldV2InferenceEngine:
             kwargs["ignore_patterns"] = ignore_patterns
 
         cached_dir = Path(snapshot_download(**kwargs))
-        print(f"[Marigold V2] 📥 Model cached at: {cached_dir}")
+        print(f"[Marigold V2] 📥 Cached at: {cached_dir}")
         return cached_dir
 
     def _load_models(self):
@@ -103,20 +103,27 @@ class MarigoldV2InferenceEngine:
         }
         sub = modality_subdirs.get(self.modality, "depth/Log-stage2")
         
+        prefix_map = {
+            "depth": "qwen_edit_2509_qwen_depth_realimg512",
+            "depth-stage1": "qwen_edit_2509_qwen_depth_realimg512",
+            "normals": "qwen_edit_2509_qwen_normals_dummy512",
+            "albedo": "qwen_edit_2509_qwen_albedo_rgb_dummy512"
+        }
+        p_prefix = prefix_map.get(self.modality, prefix_map["depth"])
+
+        # Strictly allow ONLY the 3 exact files for this specific modality
         v2_patterns = [
-            f"{sub}/*",
-            "qwen_text_embeddings/*",
-            "*.safetensors",
-            "*.json",
-            "*.yaml"
+            f"{sub}/trainables.safetensors",
+            f"qwen_text_embeddings/{p_prefix}_prompt_embeds.pt",
+            f"qwen_text_embeddings/{p_prefix}_prompt_mask.pt"
         ]
         v2_dir = self._resolve_path_or_download(
             self.checkpoint,
             allow_patterns=v2_patterns,
-            ignore_patterns=["evaluation/*", "data_split/*", "src/*"]
+            ignore_patterns=["evaluation/*", "data_split/*", "src/*", "depth/Disp*", "depth/Log/*", "normals/*", "albedo/*"] if self.modality == "depth" else None
         )
 
-        # 2. Download ONLY VAE and Transformer from base Qwen DiT (ignores huge unneeded text encoders)
+        # 2. Download ONLY VAE and Transformer from base Qwen DiT (ignores 40GB+ text encoders & tokenizers)
         qwen_patterns = [
             "vae/*.safetensors",
             "vae/*.json",
@@ -127,7 +134,7 @@ class MarigoldV2InferenceEngine:
         qwen_dir = self._resolve_path_or_download(
             self.base_model,
             allow_patterns=qwen_patterns,
-            ignore_patterns=["text_encoder*", "tokenizer*", "*.bin", "*.pt", "*.msgpack", "*.onnx"]
+            ignore_patterns=["text_encoder/**", "text_encoder_2/**", "tokenizer/**", "*.bin", "*.pt", "*.msgpack", "*.onnx", "scheduler/**", "feature_extractor/**"]
         )
 
         # 3. Load VAE
@@ -197,13 +204,6 @@ class MarigoldV2InferenceEngine:
         self.transformer.requires_grad_(False)
 
         # 6. Load precomputed prompt embeddings
-        prefix_map = {
-            "depth": "qwen_edit_2509_qwen_depth_realimg512",
-            "depth-stage1": "qwen_edit_2509_qwen_depth_realimg512",
-            "normals": "qwen_edit_2509_qwen_normals_dummy512",
-            "albedo": "qwen_edit_2509_qwen_albedo_rgb_dummy512"
-        }
-        p_prefix = prefix_map.get(self.modality, prefix_map["depth"])
         embeds_dir = v2_dir / "qwen_text_embeddings" if (v2_dir / "qwen_text_embeddings").is_dir() else v2_dir
         
         embeds_file = embeds_dir / f"{p_prefix}_prompt_embeds.pt"
