@@ -1,0 +1,29 @@
+services:
+  marigold-panorama:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: marigold-panorama-cli:latest
+    container_name: marigold-panorama-cli
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./data:/data
+      - ./checkpoints:/checkpoints
+      - ./output:/data/outputs
+    environment:
+      - MARIGOLD_OUTPUT=/data/outputs
+      - MARIGOLD_CHECKPOINT=huawei-bayerlab/marigold-v2-0
+      - MARIGOLD_DEVICE=cuda
+      - MARIGOLD_SPLIT_RESOLUTION=512
+      - MARIGOLD_BATCH_SIZE=1
+      - MARIGOLD_MAPS=true
+      - MARIGOLD_DEBUG=false
+      - MARIGOLD_DEPTH_NPY=true
+    command: ["-i", "/data/input_panorama.jpg", "-o", "/data/outputs", "--maps"]

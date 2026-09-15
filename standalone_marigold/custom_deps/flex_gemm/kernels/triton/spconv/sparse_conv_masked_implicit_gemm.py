@@ -1,0 +1,335 @@
+from typing import *
+import math
+import torch
+import triton
+import triton.language as tl
+from ....autotuner import triton_autotune
+from ..utils import autotune_size_bucket
+from . import config
+from .... import config as _global_config
+from .sparse_conv_implicit_gemm import sparse_conv_implicit_gemm_kernel
+
+
+def _valid_kernel_b1(args):
+    return args['valid_kernel'](args['B1'])
+
+
+def _valid_kernel_seg_b1(args):
+    return args['valid_kernel_seg'](args['B1'])
+
+
+@triton_autotune(
+    configs=config.autotune_config,
+    key=['LOGN', 'LOGM', 'Ci', 'Co', 'V', 'allow_tf32'],
+)
+@triton.heuristics({
+    'valid_kernel': _valid_kernel_b1,
+    'valid_kernel_seg': _valid_kernel_seg_b1,
+    'HAS_BIAS': lambda args: args['bias'] is not None,
+})
+@triton.jit
+def sparse_conv_masked_implicit_gemm_kernel(
+    input,
+    weight,
+    bias,
+    neighbor,
+    sorted_idx,
+    output,
+    # Tensor dimensions
+    M, LOGN, LOGM, Ci, Co, V: tl.constexpr,
+    # Meta-parameters
+    B1: tl.constexpr,   # Block size for M dimension
+    B2: tl.constexpr,   # Block size for Co dimension
+    BK: tl.constexpr,   # Block size for K dimension (V * Ci)
+    HAS_BIAS: tl.constexpr,  # Whether bias is present
+    allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    # Huristic parameters
+    valid_kernel,
+    valid_kernel_seg,
+    # Specialize
+    TRANSPOSE_WEIGHT: tl.constexpr = False,  # Whether to transpose the weight matrix
+    FLIP_WEIGHT: tl.constexpr = False,  # Whether to flip the weight matrix along V dimension
+):
+    """
+    Indice convolution forward kernel using masked implicit GEMM.
+    
+    Args:
+        input (pointer): A pointer to the input tensor of shape (N, Ci)
+        weight (pointer): A pointer to the weight tensor of shape (Co, V, Ci)
+        bias (pointer): A pointer to the bias tensor of shape (Co)
+        neighbor (pointer): A pointer to the neighbor tensor of shape (M, V)
+        sorted_idx (pointer): A pointer to the sorted index tensor of shape (M,)
+        valid_kernel (pointer): A pointer to the valid neighbor index tensor of shape (L,)
+        valid_kernel_seg (pointer): A pointer to the valid neighbor index segment tensor of shape (BLOCK_M + 1,)
+        output (pointer): A pointer to the output tensor of shape (M, Co)
+    """
+    block_id = tl.program_id(axis=0)
+    block_dim_co = tl.cdiv(Co, B2)
+    block_id_co = block_id % block_dim_co
+    block_id_m = block_id // block_dim_co
+    
+    # Create pointers for submatrices of A and B.
+    num_k = tl.cdiv(Ci, BK)  # Number of blocks in K dimension
+    valid_kernel_start = tl.load(valid_kernel_seg + block_id_m)
+    valid_kernel_seglen = tl.load(valid_kernel_seg + block_id_m + 1) - valid_kernel_start
+    offset_m = block_id_m * B1 + tl.arange(0, B1)
+    m_mask = offset_m < M
+    offset_sorted_m = tl.load(sorted_idx + offset_m, mask=m_mask, other=0)  # (B1,)
+    offset_co = (block_id_co * B2 + tl.arange(0, B2)) % Co                  # (B2,)
+    offset_k = tl.arange(0, BK)                                             # (BK,)
+    
+    # Create a block of the output matrix C.
+    accumulator = tl.zeros((B1, B2), dtype=tl.float32)
+    
+    # Iterate along V*Ci dimension.
+    for k in range(num_k * valid_kernel_seglen):
+        v = k // num_k
+        bk = k % num_k
+        v = tl.load(valid_kernel + valid_kernel_start + v)
+        # Calculate pointers to weight matrix.
+        weight_v = V - 1 - v if FLIP_WEIGHT else v
+        if not TRANSPOSE_WEIGHT:
+            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (weight_v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
+        else:
+            weight_ptr = weight + (offset_co[None, :]) + (weight_v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
+        # Calculate pointers to input matrix.
+        neighbor_offset = tl.load(neighbor + offset_sorted_m * V + v)                             # (B1,)
+        input_ptr = input + bk * BK + (neighbor_offset[:, None].to(tl.int64) * Ci + offset_k[None, :])         # (B1, BK)
+        # Load the next block of input and weight.
+        neigh_mask = neighbor_offset != 0xffffffff
+        k_mask = offset_k < Ci - bk * BK
+        input_block = tl.load(input_ptr, mask=neigh_mask[:, None] & k_mask[None, :], other=0.0)
+        weight_block = tl.load(weight_ptr, mask=k_mask[:, None], other=0.0)
+        # Accumulate along the K dimension.
+        accumulator = tl.dot(input_block, weight_block, accumulator,
+                             input_precision='tf32' if allow_tf32 else 'ieee')                      # (B1, B2)
+
+    # Add bias on the fp32 accumulator (before down-casting) so that bias
+    # contributes at full precision even under fp16 / bf16 AMP.
+    if HAS_BIAS:
+        co_mask = block_id_co * B2 + tl.arange(0, B2) < Co
+        bias_block = tl.load(bias + offset_co, mask=co_mask, other=0.0)
+        accumulator += bias_block[None, :]
+
+    c = accumulator.to(input.type.element_ty)
+
+    # Write back the block of the output matrix with masks.
+    out_offset_m = offset_sorted_m
+    out_offset_co = block_id_co * B2 + tl.arange(0, B2)
+    out_ptr = output + (out_offset_m[:, None].to(tl.int64) * Co + out_offset_co[None, :])
+    out_mask = m_mask[:, None] & (out_offset_co[None, :] < Co)
+    tl.store(out_ptr, c, mask=out_mask)
+    
+
+@triton_autotune(
+    configs=config.bwd_weight_autotune_config,
+    key=['LOGN', 'LOGM', 'Ci', 'Co', 'V', 'allow_tf32'],
+)
+@triton.jit
+def sparse_conv_bwd_weight_masked_implicit_gemm_kernel(
+    grad_output,
+    input,
+    valid_signal_i,
+    valid_signal_o,
+    valid_signal_seg,
+    grad_weight,
+    # Tensor dimensions
+    M, LOGN, LOGM, Ci, Co, V: tl.constexpr,
+    # Meta-parameters
+    B1: tl.constexpr,   # Block size for Co dimension
+    B2: tl.constexpr,   # Block size for Ci dimension
+    BK: tl.constexpr,   # Block size for K dimension
+    allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+):
+    """
+    Indice convolution backward to weight kernel using masked implicit GEMM.
+    
+    Args:
+        grad_output (pointer): A pointer to the gradient of the output tensor of shape (M, Co)
+        input (pointer): A pointer to the input tensor of shape (N, Ci)
+        valid_signal_i (pointer): A pointer to the valid input signal tensor of shape (L,)
+        valid_signal_o (pointer): A pointer to the valid output signal tensor of shape (L,)
+        valid_signal_seg (pointer): A pointer to the valid signal index segment tensor of shape (V + 1)
+        grad_weight (pointer): A pointer to the gradient of the weight tensor of shape (Co, V, Ci)
+    """
+    num_blocks_co = tl.cdiv(Co, B1)
+    num_blocks_ci = tl.cdiv(Ci, B2)
+    block_id = tl.program_id(axis=0)
+    block_id_co = block_id % num_blocks_co
+    block_id_ci = block_id // num_blocks_co % num_blocks_ci
+    block_id_v = block_id // (num_blocks_co * num_blocks_ci)
+    
+    # Create pointers for submatrices of A and B.
+    valid_signal_start = tl.load(valid_signal_seg + block_id_v)
+    valid_signal_seglen = tl.load(valid_signal_seg + block_id_v + 1) - valid_signal_start
+    num_k = tl.cdiv(valid_signal_seglen, BK)  # Number of blocks in K dimension
+    offset_co = (block_id_co * B1 + tl.arange(0, B1)) % Co                          # (B1,)
+    offset_ci = (block_id_ci * B2 + tl.arange(0, B2)) % Ci                          # (B2,)
+    offset_k = tl.arange(0, BK)                                                     # (BK,)
+    
+    valid_signal_i_ptr = valid_signal_i + valid_signal_start + offset_k
+    valid_signal_o_ptr = valid_signal_o + valid_signal_start + offset_k
+    
+    # Create a block of the output matrix C.
+    accumulator = tl.zeros((B1, B2), dtype=tl.float32)   
+    
+    # Iterate along V*Ci dimension.
+    for k in range(num_k):
+        # Calculate pointers to input and grad_output matrix.
+        mask = offset_k < valid_signal_seglen - k * BK
+        input_offset_n = tl.load(valid_signal_i_ptr, mask=mask, other=0)                            # (BK,)
+        grad_output_offset_n = tl.load(valid_signal_o_ptr, mask=mask, other=0)                      # (BK,)
+        input_ptr = input + (input_offset_n[:, None].to(tl.int64) * Ci + offset_ci[None, :])                     # (BK, B2)
+        grad_output_ptr = grad_output + grad_output_offset_n[None, :].to(tl.int64) * Co + offset_co[:, None]     # (B1, BK)
+        # Load the next block of input and grad_output.
+        input_block = tl.load(input_ptr, mask=mask[:, None], other=0.0)
+        grad_output_block = tl.load(grad_output_ptr, mask=mask[None, :], other=0.0)
+        # Accumulate along the K dimension.
+        accumulator = tl.dot(grad_output_block, input_block, accumulator,
+                             input_precision='tf32' if allow_tf32 else 'ieee')                      # (B1, B2)
+        # Advance pointers.
+        valid_signal_i_ptr += BK
+        valid_signal_o_ptr += BK
+    c = accumulator.to(grad_output.type.element_ty)
+                
+    # Write back the block of the output matrix with masks.
+    grad_weight_offset_co = block_id_co * B1 + tl.arange(0, B1)
+    grad_weight_offset_ci = block_id_ci * B2 + tl.arange(0, B2)
+    grad_weight_ptr = grad_weight + (grad_weight_offset_co[:, None] * V * Ci + block_id_v * Ci + grad_weight_offset_ci[None, :])
+    grad_weight_mask = (grad_weight_offset_co[:, None] < Co) & (grad_weight_offset_ci[None, :] < Ci)
+    tl.store(grad_weight_ptr, c, mask=grad_weight_mask)
+
+
+def sparse_conv_fwd_masked_implicit_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    fwd_neighbor_map: torch.Tensor,
+    fwd_sorted_idx: torch.Tensor,
+    fwd_valid_kernel: Callable[[int], torch.Tensor],
+    fwd_valid_kernel_seg: Callable[[int], torch.Tensor],
+    allow_tf32: Optional[bool] = None,
+) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
+    assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
+    assert input.is_contiguous(), "Matrix input must be contiguous"
+    assert weight.is_contiguous(), "Matrix weight must be contiguous"
+    assert fwd_neighbor_map.is_contiguous(), "Matrix neighbor must be contiguous"
+    N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
+    # Allocate output matrix output.
+    output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
+    # Launch the kernel.
+    grid = lambda META: (triton.cdiv(Co, META['B2']) * triton.cdiv(M, META['B1']),)
+    sparse_conv_masked_implicit_gemm_kernel[grid](
+        input, weight, bias, fwd_neighbor_map, fwd_sorted_idx, output,
+        M, LOGN, LOGM, Ci, Co, V,
+        valid_kernel=fwd_valid_kernel,
+        valid_kernel_seg=fwd_valid_kernel_seg,
+        allow_tf32=allow_tf32,
+    )
+    return output
+
+
+def sparse_conv_bwd_input_masked_implicit_gemm(
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    symmetric: bool,
+    fwd_neighbor_map: Optional[torch.Tensor] = None,
+    fwd_sorted_idx: Optional[torch.Tensor] = None,
+    fwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
+    fwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
+    bwd_neighbor_map: Optional[torch.Tensor] = None,
+    bwd_sorted_idx: Optional[torch.Tensor] = None,
+    bwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
+    bwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
+    allow_tf32: Optional[bool] = None,
+) -> torch.Tensor:
+    """
+    Backward to input for sparse convolution using masked implicit GEMM.
+
+    Cache arguments are keyword-only. When ``symmetric=True``, pass the
+    ``fwd_*`` cache; the weight matrix is internally flipped along the V dimension
+    so the forward cache is reused. Otherwise, pass the ``bwd_*`` cache.
+    """
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
+    if symmetric:
+        assert fwd_neighbor_map is not None, "symmetric=True requires fwd_neighbor_map"
+        assert bwd_neighbor_map is None and bwd_sorted_idx is None \
+            and bwd_valid_kernel is None and bwd_valid_kernel_seg is None, \
+            "symmetric=True forbids passing bwd_* cache arguments"
+        neighbor_map = fwd_neighbor_map
+        sorted_idx = fwd_sorted_idx
+        valid_kernel_cb = fwd_valid_kernel
+        valid_kernel_seg_cb = fwd_valid_kernel_seg
+    else:
+        assert bwd_neighbor_map is not None, "symmetric=False requires bwd_neighbor_map"
+        assert fwd_neighbor_map is None and fwd_sorted_idx is None \
+            and fwd_valid_kernel is None and fwd_valid_kernel_seg is None, \
+            "symmetric=False forbids passing fwd_* cache arguments"
+        neighbor_map = bwd_neighbor_map
+        sorted_idx = bwd_sorted_idx
+        valid_kernel_cb = bwd_valid_kernel
+        valid_kernel_seg_cb = bwd_valid_kernel_seg
+
+    Co, V, Ci = weight.shape
+    M = grad_output.shape[0]
+    N = neighbor_map.shape[0]
+
+    grad_input = torch.empty((N, Ci), device=grad_output.device, dtype=grad_output.dtype)
+    grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
+    if sorted_idx is None:
+        sparse_conv_implicit_gemm_kernel[grid](
+            grad_output, weight, None, neighbor_map, grad_input,
+            N, autotune_size_bucket(M), autotune_size_bucket(N), Co, Ci, V,
+            allow_tf32=allow_tf32,
+            TRANSPOSE_WEIGHT=True,
+            FLIP_WEIGHT=symmetric,
+        )
+    else:
+        sparse_conv_masked_implicit_gemm_kernel[grid](
+            grad_output, weight, None, neighbor_map, sorted_idx, grad_input,
+            N, autotune_size_bucket(M), autotune_size_bucket(N), Co, Ci, V,
+            valid_kernel=valid_kernel_cb,
+            valid_kernel_seg=valid_kernel_seg_cb,
+            allow_tf32=allow_tf32,
+            TRANSPOSE_WEIGHT=True,
+            FLIP_WEIGHT=symmetric,
+        )
+    return grad_input
+
+
+def sparse_conv_bwd_weight_masked_implicit_gemm(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    fwd_valid_signal_i: torch.Tensor,
+    fwd_valid_signal_o: torch.Tensor,
+    fwd_valid_signal_seg: torch.Tensor,
+    allow_tf32: Optional[bool] = None,
+) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
+    Co = grad_output.shape[1]
+    Ci = input.shape[1]
+    V = fwd_valid_signal_seg.shape[0] - 1
+    M = grad_output.shape[0]
+    N = input.shape[0]
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
+    
+    grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
+    grid = lambda META: (triton.cdiv(Co, META['B1']) * triton.cdiv(Ci, META['B2']) * V,)
+    sparse_conv_bwd_weight_masked_implicit_gemm_kernel[grid](
+        grad_output, input,
+        fwd_valid_signal_i,
+        fwd_valid_signal_o,
+        fwd_valid_signal_seg,
+        grad_weight,
+        M, LOGN, LOGM, Ci, Co, V,
+        allow_tf32=allow_tf32,
+    )
+    return grad_weight

@@ -1,0 +1,51 @@
+# Git & Version Control
+.git/
+.gitignore
+.github/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# UV Cache
+.uv/
+.uv_cache/
+
+# Host Mounted Checkpoints & Weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Data & Output Directories
+data/
+output/
+outputs/
+*.exr
+*.npy
+
+# IDEs & System Files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Documentation & Docker Configurations
+Dockerfile
+docker-compose.yml
+.dockerignore
+*.log

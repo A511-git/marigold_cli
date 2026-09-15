@@ -1,0 +1,20 @@
+# Core PyTorch & CUDA
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Scientific & Image Processing
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+pillow>=10.0.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+click>=8.1.0
+omegaconf>=2.3.0
+
+# Diffusion & Model Transformers
+diffusers>=0.28.0
+transformers>=4.40.0
+accelerate>=0.28.0
+safetensors>=0.4.0
+huggingface_hub>=0.21.0
