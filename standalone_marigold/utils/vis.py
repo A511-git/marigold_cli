@@ -1,7 +1,15 @@
 from typing import *
 
+import os
+if os.environ.get('MPLBACKEND', '').startswith('module://'):
+    os.environ['MPLBACKEND'] = 'Agg'
+
 import numpy as np
 import matplotlib
+try:
+    matplotlib.use('Agg', force=False)
+except Exception:
+    pass
 
 
 def colorize_depth(depth: np.ndarray, mask: np.ndarray = None, normalize: bool = True, cmap: str = 'Spectral') -> np.ndarray:

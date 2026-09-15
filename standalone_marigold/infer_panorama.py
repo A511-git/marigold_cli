@@ -5,10 +5,12 @@ Maps MoGe's icosahedron spherical splitting & Poisson solver directly to Marigol
 """
 
 import os
+if os.environ.get('MPLBACKEND', '').startswith('module://'):
+    os.environ['MPLBACKEND'] = 'Agg'
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
 import sys
 from pathlib import Path
-
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 
 # Ensure root directory is in sys.path
 _parent_dir = str(Path(__file__).resolve().parent)
@@ -25,6 +27,20 @@ import click
 import numpy as np
 import torch
 from tqdm import tqdm, trange
+
+def save_exr_safely(filepath, img_array: np.ndarray):
+    """Safely saves float32 EXR image using OpenCV or imageio fallback without throwing uncaught exceptions."""
+    arr = np.ascontiguousarray(img_array.astype(np.float32))
+    try:
+        if cv2.imwrite(str(filepath), arr, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT]):
+            return
+    except Exception:
+        pass
+    try:
+        import imageio.v3 as iio
+        iio.imwrite(str(filepath), arr)
+    except Exception:
+        pass
 
 try:
     from standalone_marigold.custom_deps import utils3d_moge as utils3d
@@ -257,9 +273,9 @@ def main(
             for i in range(len(splitted_images)):
                 cv2.imwrite(str(splitted_dir / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
                 cv2.imwrite(str(splitted_dir / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_depth.exr'), splitted_depth_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                save_exr_safely(splitted_dir / f'{i:02d}_depth.exr', splitted_depth_maps[i])
                 cv2.imwrite(str(splitted_dir / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                save_exr_safely(splitted_dir / f'{i:02d}_distance.exr', splitted_distance_maps[i])
                 cv2.imwrite(str(splitted_dir / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
 
                 fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intrinsics[i]))
@@ -304,7 +320,7 @@ def main(
 
         if save_maps_:
             cv2.imwrite(str(save_path / 'depth_vis.png'), cv2.cvtColor(colorize_depth(panorama_depth, panorama_mask), cv2.COLOR_RGB2BGR))
-            cv2.imwrite(str(save_path / 'depth.exr'), panorama_depth.astype(np.float32), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+            save_exr_safely(save_path / 'depth.exr', panorama_depth)
             cv2.imwrite(str(save_path / 'mask.png'), (panorama_mask * 255).astype(np.uint8))
 
         if save_points_ply:
