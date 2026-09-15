@@ -138,14 +138,16 @@ def solve_poisson_cg_torch(
     kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
 
     def apply_A(v: torch.Tensor):
-        # Gx: v[:, :-1] - v[:, 1:] with circular horizontal wrap
+        # v_pad_x has shape [H, W + 1]
         v_pad_x = torch.cat([v, v[:, :1]], dim=1)
+
+        # Gx: [H, W]
         gx = (v_pad_x[:, :-1] - v_pad_x[:, 1:]) * mask_x
 
-        # Gy: v[:-1, :] - v[1:, :]
-        gy = (v[:-1, :] - v[1:, :]) * mask_y
+        # Gy: [H - 1, W + 1]
+        gy = (v_pad_x[:-1, :] - v_pad_x[1:, :]) * mask_y
 
-        # Lap: 2D conv with laplacian kernel (circular along x, replicate along y)
+        # Lap: [H, W] (2D conv with circular wrap along x, replicate along y)
         v_pad_lap = F.pad(v.unsqueeze(0).unsqueeze(0), (1, 1, 0, 0), mode='circular')
         v_pad_lap = F.pad(v_pad_lap, (0, 0, 1, 1), mode='replicate')
         lap = F.conv2d(v_pad_lap, kernel).squeeze(0).squeeze(0) * mask_lap
@@ -153,15 +155,17 @@ def solve_poisson_cg_torch(
         return gx, gy, lap
 
     def apply_At(gx: torch.Tensor, gy: torch.Tensor, lap: torch.Tensor):
-        # Gx^T: circular transpose
+        # Gx^T: [H, W]
         g_pad_x = torch.cat([gx[:, -1:], gx], dim=1)
         at_gx = g_pad_x[:, 1:] - g_pad_x[:, :-1]
 
-        # Gy^T: zero-padded transpose
+        # Gy^T: [H - 1, W + 1] -> [H, W + 1] -> folded to [H, W]
         g_pad_y = F.pad(gy.unsqueeze(0).unsqueeze(0), (0, 0, 1, 1), mode='constant', value=0).squeeze(0).squeeze(0)
-        at_gy = g_pad_y[:-1, :] - g_pad_y[1:, :]
+        diff_y = g_pad_y[:-1, :] - g_pad_y[1:, :]
+        at_gy = diff_y[:, :W].clone()
+        at_gy[:, 0] = at_gy[:, 0] + diff_y[:, W]
 
-        # Lap^T: symmetric kernel
+        # Lap^T: [H, W] (symmetric 2D Laplacian operator)
         lap_pad = F.pad((lap * mask_lap).unsqueeze(0).unsqueeze(0), (1, 1, 0, 0), mode='circular')
         lap_pad = F.pad(lap_pad, (0, 0, 1, 1), mode='replicate')
         at_lap = F.conv2d(lap_pad, kernel).squeeze(0).squeeze(0)
