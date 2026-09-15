@@ -311,24 +311,26 @@ class MarigoldV2InferenceEngine:
             inp = torch.stack(batch_tensors, dim=0).to(self.device)
             B, C, H, W = inp.shape
 
-            # 1. VAE Encode
-            latents = self.vae.encode(inp.unsqueeze(2)).latent_dist.sample()
-            mean, std_inv = _latent_stats(self.vae, latents)
-            lat = ((latents - mean) * std_inv)[:, :, 0]
-            del inp, latents
+            # 1. VAE Encode into 5D normalized latents [B, C, 1, H_lat, W_lat]
+            raw_latents = self.vae.encode(inp.unsqueeze(2)).latent_dist.sample()
+            mean, std_inv = _latent_stats(self.vae, raw_latents)
+            lat_5d = (raw_latents - mean) * std_inv
+            del inp, raw_latents
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            # 2. Pack latents
+            _, C_lat, _, lat_h, lat_w = lat_5d.shape
+
+            # 2. Pack latents [B, (lat_h/2)*(lat_w/2), C_lat*4]
             packed = QwenImageEditPipeline._pack_latents(
-                lat, batch_size=B, num_channels_latents=lat.shape[1], height=lat.shape[2], width=lat.shape[3]
+                lat_5d[:, :, 0], batch_size=B, num_channels_latents=C_lat, height=lat_h, width=lat_w
             ).to(self.dtype)
 
             # 3. DiT Single Step at t = 0.499
             timestep = torch.full((B,), 499.0, device=self.device, dtype=self.dtype) / 1000.0
             p_embeds = self.prompt_embeds[:1].repeat(B, 1, 1).to(self.device, dtype=self.dtype)
             p_mask = self.prompt_mask[:1].repeat(B, 1).to(self.device, dtype=torch.bool)
-            img_shapes = [[(1, lat.shape[2] // 2, lat.shape[3] // 2)]] * B
+            img_shapes = [[(1, lat_h // 2, lat_w // 2)]] * B
             txt_seq_lens = p_mask.sum(dim=1).tolist()
 
             # Dynamically inspect supported arguments of the loaded transformer model
@@ -361,19 +363,18 @@ class MarigoldV2InferenceEngine:
             velocity = out[0] if isinstance(out, (tuple, list)) else out.sample
             del packed, p_embeds, p_mask
 
-            # 4. Integrate flow step (t -> 0)
+            # 4. Unpack velocity into 5D [B, C, 1, H_lat, W_lat] and integrate flow step (velocity subtraction)
             unpacked_v = QwenImageEditPipeline._unpack_latents(
-                velocity, height=lat.shape[2] * 8, width=lat.shape[3] * 8, vae_scale_factor=8
+                velocity, height=lat_h * 8, width=lat_w * 8, vae_scale_factor=8
             )
-            lat_out = lat - (timestep[0] * unpacked_v)
-            del velocity, unpacked_v, lat
+            lat_out_5d = lat_5d - unpacked_v.to(lat_5d.dtype)
+            del velocity, unpacked_v, lat_5d
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            # 5. VAE Decode
-            lat_out_5d = lat_out.unsqueeze(2)
+            # 5. VAE Decode (unnormalize 5D latents and decode)
             lat_out_unnorm = lat_out_5d / std_inv + mean
-            del lat_out, lat_out_5d
+            del lat_out_5d
             decoded = self.vae.decode(lat_out_unnorm).sample[:, :, 0]
             del lat_out_unnorm, mean, std_inv
 
