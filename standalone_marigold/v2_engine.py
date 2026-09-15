@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 import logging
 from pathlib import Path
 from typing import List, Optional, Union, Dict, Any
@@ -330,20 +331,32 @@ class MarigoldV2InferenceEngine:
             img_shapes = [[(1, lat.shape[2] // 2, lat.shape[3] // 2)]] * B
             txt_seq_lens = p_mask.sum(dim=1).tolist()
 
-            transformer_kwargs = dict(
-                hidden_states=packed,
-                timestep=timestep,
-                encoder_hidden_states=p_embeds,
-                encoder_hidden_states_mask=p_mask,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                return_dict=False
-            )
+            # Dynamically inspect supported arguments of the loaded transformer model
+            sig_params = inspect.signature(self.transformer.forward).parameters
+            candidate_kwargs = {
+                "hidden_states": packed,
+                "timestep": timestep,
+                "encoder_hidden_states": p_embeds,
+                "encoder_hidden_states_mask": p_mask,
+                "encoder_attention_mask": p_mask,
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+                "guidance": None,
+                "return_dict": False,
+            }
+            call_kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig_params and v is not None}
+            if "return_dict" in sig_params:
+                call_kwargs["return_dict"] = False
+
             try:
-                out = self.transformer(**transformer_kwargs)
-            except TypeError:
-                transformer_kwargs.pop("encoder_hidden_states_mask", None)
-                out = self.transformer(**transformer_kwargs)
+                out = self.transformer(**call_kwargs)
+            except Exception:
+                fallback_kwargs = {
+                    "hidden_states": packed,
+                    "timestep": timestep,
+                    "encoder_hidden_states": p_embeds,
+                }
+                out = self.transformer(**{k: v for k, v in fallback_kwargs.items() if k in sig_params})
 
             velocity = out[0] if isinstance(out, (tuple, list)) else out.sample
             del packed, p_embeds, p_mask
