@@ -149,39 +149,55 @@ class MarigoldInferenceEngine:
                 print(f"[Marigold V2] ❌ Fatal: Failed to load Marigold V2 into VRAM: {e2}")
                 raise RuntimeError(f"Could not load Marigold V2 checkpoint '{self.checkpoint}' on {self.device}: {e2}")
 
-    def predict_depth_tile(self, image_bgr: np.ndarray) -> np.ndarray:
+    def predict_depth_batch(self, images_bgr: List[np.ndarray], batch_size: int = 4) -> List[np.ndarray]:
         """
-        Runs Marigold V2 depth estimation on a single perspective tile.
-        Returns:
-            2D numpy array [H, W] float32 relative depth.
+        Runs batched Marigold depth estimation on perspective tiles on the GPU.
         """
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         from PIL import Image
-        pil_img = Image.fromarray(image_rgb)
+        pil_images = [Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in images_bgr]
 
-        if self.pipeline is not None:
-            # 4 steps for optimal Marigold V2 quality, 1 step for LCM
-            num_steps = 1 if "lcm" in self.checkpoint.lower() else 4
+        depths = []
+        num_steps = 1 if "lcm" in self.checkpoint.lower() else 4
+        bs = max(1, batch_size)
+
+        for i in range(0, len(pil_images), bs):
+            batch = pil_images[i : i + bs]
             with torch.inference_mode():
                 out = self.pipeline(
-                    pil_img,
+                    batch if len(batch) > 1 else batch[0],
                     num_inference_steps=num_steps,
                     ensemble_size=1
                 )
 
             if hasattr(out, "depth_np"):
-                return out.depth_np.squeeze().astype(np.float32)
+                d_np = out.depth_np
+                if d_np.ndim == 2:
+                    depths.append(d_np.astype(np.float32))
+                else:
+                    for d in d_np:
+                        depths.append(d.squeeze().astype(np.float32))
             elif hasattr(out, "prediction"):
                 pred = out.prediction
                 if isinstance(pred, torch.Tensor):
-                    return pred.squeeze().cpu().numpy().astype(np.float32)
-                return np.array(pred).squeeze().astype(np.float32)
-            elif hasattr(out, "depth_16bit"):
-                return (out.depth_16bit.squeeze().astype(np.float32) / 65535.0)
-            elif isinstance(out, (list, tuple)):
-                return np.array(out[0]).squeeze().astype(np.float32)
+                    pred = pred.cpu().numpy()
+                if pred.ndim == 2:
+                    depths.append(pred.astype(np.float32))
+                else:
+                    for d in pred:
+                        depths.append(d.squeeze().astype(np.float32))
+            else:
+                for b in batch:
+                    depths.append(self.predict_depth_tile(cv2.cvtColor(np.array(b), cv2.COLOR_RGB2BGR)))
 
-        raise RuntimeError("Marigold V2 pipeline is not loaded on GPU!")
+        return depths
+
+    def predict_depth_tile(self, image_bgr: np.ndarray) -> np.ndarray:
+        """
+        Runs Marigold depth estimation on a single perspective tile.
+        Returns:
+            2D numpy array [H, W] float32 relative depth.
+        """
+        return self.predict_depth_batch([image_bgr], batch_size=1)[0]
 
 
 @click.command(help='Standalone Marigold-360 Panorama Inference CLI (Docker / Direct CLI)')
@@ -284,20 +300,15 @@ def main(
         t1 = time.time()
         print(f"[{idx}/{len(image_paths)}] Split 12 perspective views: {t1 - t0:.3f}s")
 
-        # 2. Infer views with Marigold & convert to radial distance maps
+        # 2. Batched GPU inference on 12 perspective views
+        splitted_images_bgr = [cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in splitted_images]
+        splitted_depth_maps = engine.predict_depth_batch(splitted_images_bgr, batch_size=batch_size)
+
         splitted_distance_maps = []
         splitted_masks = []
-        splitted_depth_maps = []
 
-        for i in range(len(splitted_images)):
-            tile_rgb = splitted_images[i]
-            tile_bgr = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR)
-
-            # Monocular depth from Marigold
-            tile_depth = engine.predict_depth_tile(tile_bgr)
-            splitted_depth_maps.append(tile_depth)
-
-            # Convert Planar Depth Z to Radial Distance r = Z * sqrt(1 + (u/fx)^2 + (v/fy)^2)
+        for i in range(len(splitted_depth_maps)):
+            tile_depth = splitted_depth_maps[i]
             h, w = tile_depth.shape[:2]
             intr = splitted_intrinsics[i]
             fx, fy = intr[0, 0] * w, intr[1, 1] * h
@@ -315,7 +326,7 @@ def main(
             splitted_masks.append(mask)
 
         t2 = time.time()
-        print(f"[{idx}/{len(image_paths)}] Marigold inference: {t2 - t1:.3f}s")
+        print(f"[{idx}/{len(image_paths)}] GPU Marigold inference: {t2 - t1:.3f}s")
 
         # Save debug artifacts if requested
         if save_debug:
@@ -348,9 +359,9 @@ def main(
             with open(splitted_dir / 'cameras.json', 'w') as f:
                 json.dump({'views': cameras_meta}, f, indent=2)
 
-        # 3. Merge panoramic depth using sparse Poisson linear solver
+        # 3. Merge panoramic depth using sparse Poisson linear solver (optimized multi-grid resolution)
         t3 = time.time()
-        merging_width, merging_height = min(1920, target_width), min(960, target_height)
+        merging_width, merging_height = min(1024, target_width), min(512, target_height)
         panorama_depth, panorama_mask = merge_panorama_depth(
             merging_width,
             merging_height,
