@@ -330,15 +330,22 @@ class MarigoldV2InferenceEngine:
             img_shapes = [[(1, lat.shape[2] // 2, lat.shape[3] // 2)]] * B
             txt_seq_lens = p_mask.sum(dim=1).tolist()
 
-            velocity = self.transformer(
+            transformer_kwargs = dict(
                 hidden_states=packed,
                 timestep=timestep,
                 encoder_hidden_states=p_embeds,
-                encoder_attention_mask=p_mask,
+                encoder_hidden_states_mask=p_mask,
                 img_shapes=img_shapes,
                 txt_seq_lens=txt_seq_lens,
                 return_dict=False
-            )[0]
+            )
+            try:
+                out = self.transformer(**transformer_kwargs)
+            except TypeError:
+                transformer_kwargs.pop("encoder_hidden_states_mask", None)
+                out = self.transformer(**transformer_kwargs)
+
+            velocity = out[0] if isinstance(out, (tuple, list)) else out.sample
             del packed, p_embeds, p_mask
 
             # 4. Integrate flow step (t -> 0)
