@@ -76,20 +76,24 @@ except ImportError:
 
 
 CHECKPOINT_ALIASES = {
-    "huawei-bayerlab/marigold-v2-0": "prs-eth/marigold-v2-0",
-    "marigold-v2-0": "prs-eth/marigold-v2-0",
-    "marigold-v2": "prs-eth/marigold-v2-0",
+    "prs-eth/marigold-v2-0": "prs-eth/marigold-depth-v1-1",
+    "huawei-bayerlab/marigold-v2-0": "prs-eth/marigold-depth-v1-1",
+    "marigold-v2-0": "prs-eth/marigold-depth-v1-1",
+    "marigold-v2": "prs-eth/marigold-depth-v1-1",
     "marigold-depth-v1-1": "prs-eth/marigold-depth-v1-1",
+    "marigold-depth": "prs-eth/marigold-depth-v1-1",
     "marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
     "marigold-depth-lcm": "prs-eth/marigold-depth-lcm-v1-0",
+    "prs-eth/marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
+    "default": "prs-eth/marigold-depth-v1-1",
 }
 
 
 class MarigoldInferenceEngine:
-    """Loads and manages official Marigold V2 diffusion depth model on GPU."""
+    """Loads and manages official Marigold diffusion depth model on GPU."""
     def __init__(
         self,
-        checkpoint: str = "prs-eth/marigold-v2-0",
+        checkpoint: str = "prs-eth/marigold-depth-v1-1",
         device: str = "cuda",
         use_fp16: bool = True,
         use_diffusers: bool = True
@@ -183,7 +187,7 @@ class MarigoldInferenceEngine:
 @click.command(help='Standalone Marigold-360 Panorama Inference CLI (Docker / Direct CLI)')
 @click.option('--input', '-i', 'input_path', type=click.Path(exists=True), required=True, help='Input panorama image or folder path (JPG/PNG/WEBP). [REQUIRED via CLI]')
 @click.option('--output', '-o', 'output_path', type=click.Path(), envvar='MARIGOLD_OUTPUT', default='./output', show_default=True, help='Output directory for generated artifacts. [env: MARIGOLD_OUTPUT]')
-@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='prs-eth/marigold-v2-0', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
+@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='prs-eth/marigold-depth-v1-1', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
 @click.option('--device', 'device_name', type=str, envvar='MARIGOLD_DEVICE', default='cuda', show_default=True, help='Device (e.g. "cuda", "cuda:0", "cpu"). [env: MARIGOLD_DEVICE]')
 @click.option('--fp16', 'use_fp16', is_flag=True, envvar='MARIGOLD_FP16', default=True, help='Use FP16 precision for faster inference. [env: MARIGOLD_FP16]')
 @click.option('--diffusers', 'use_diffusers', is_flag=True, envvar='MARIGOLD_DIFFUSERS', default=True, help='Use Hugging Face Diffusers backend. [env: MARIGOLD_DIFFUSERS]')
