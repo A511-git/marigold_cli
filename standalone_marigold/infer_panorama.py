@@ -100,7 +100,8 @@ class MarigoldInferenceEngine:
     ):
         if torch.cuda.is_available() and "cuda" in str(device):
             self.device = torch.device(device)
-            torch.cuda.set_device(self.device)
+            if self.device.index is not None:
+                torch.cuda.set_device(self.device.index)
         else:
             self.device = torch.device("cpu")
 
