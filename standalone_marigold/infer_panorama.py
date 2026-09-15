@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Standalone Marigold-360 Panorama Inference CLI.
-Maps MoGe's icosahedron spherical splitting & Poisson solver directly to Marigold monocular depth estimation.
+🌸 Standalone Marigold V2 360° Panorama Inference CLI.
+Maps MoGe's icosahedron spherical camera splitting & PyTorch GPU Poisson solver directly to Marigold V2 DiT monocular depth estimation.
 """
 
 import os
@@ -20,7 +20,7 @@ if _parent_dir not in sys.path:
 import json
 import itertools
 import time
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any, Union
 
 import cv2
 import click
@@ -51,6 +51,7 @@ try:
         split_panorama_image,
         merge_panorama_depth
     )
+    from standalone_marigold.v2_engine import MarigoldV2InferenceEngine
 except ImportError:
     try:
         from .custom_deps import utils3d_moge as utils3d
@@ -61,6 +62,7 @@ except ImportError:
             split_panorama_image,
             merge_panorama_depth
         )
+        from .v2_engine import MarigoldV2InferenceEngine
     except (ImportError, ValueError):
         try:
             import utils3d_moge as utils3d
@@ -73,160 +75,33 @@ except ImportError:
             split_panorama_image,
             merge_panorama_depth
         )
-
-
-CHECKPOINT_ALIASES = {
-    "prs-eth/marigold-v2-0": "huawei-bayerlab/marigold-v2-0",
-    "huawei-bayerlab/marigold-v2-0": "huawei-bayerlab/marigold-v2-0",
-    "marigold-v2-0": "huawei-bayerlab/marigold-v2-0",
-    "marigold-v2": "huawei-bayerlab/marigold-v2-0",
-    "v2": "huawei-bayerlab/marigold-v2-0",
-    "marigold-depth-v1-1": "prs-eth/marigold-depth-v1-1",
-    "marigold-depth": "prs-eth/marigold-depth-v1-1",
-    "marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
-    "marigold-depth-lcm": "prs-eth/marigold-depth-lcm-v1-0",
-    "prs-eth/marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
-    "default": "huawei-bayerlab/marigold-v2-0",
-}
+        from v2_engine import MarigoldV2InferenceEngine
 
 
 def create_inference_engine(
     checkpoint: str = "huawei-bayerlab/marigold-v2-0",
+    base_model: str = "Qwen/Qwen-Image-Edit-2509",
+    modality: str = "depth",
     device: str = "cuda",
-    use_fp16: bool = True,
-    use_diffusers: bool = True,
-    quantization: str = "4bit"
-):
-    resolved = CHECKPOINT_ALIASES.get(checkpoint, checkpoint)
-    if "v2" in resolved.lower() or "huawei" in resolved.lower():
-        try:
-            from standalone_marigold.v2_engine import MarigoldV2InferenceEngine
-            return MarigoldV2InferenceEngine(
-                checkpoint=resolved,
-                modality="depth",
-                device=device,
-                quantization=quantization,
-                use_fp16=use_fp16
-            )
-        except Exception as e:
-            print(f"[Warning] Notice loading Marigold V2 DiT engine: {e}. Falling back to Marigold V1.1 Diffusers engine...")
-            return MarigoldInferenceEngine(
-                checkpoint="prs-eth/marigold-depth-v1-1",
-                device=device,
-                use_fp16=use_fp16,
-                use_diffusers=use_diffusers
-            )
-    else:
-        return MarigoldInferenceEngine(
-            checkpoint=resolved,
-            device=device,
-            use_fp16=use_fp16,
-            use_diffusers=use_diffusers
-        )
-
-
-class MarigoldInferenceEngine:
-    """Loads and manages official Marigold diffusion depth model on GPU."""
-    def __init__(
-        self,
-        checkpoint: str = "prs-eth/marigold-depth-v1-1",
-        device: str = "cuda",
-        use_fp16: bool = True,
-        use_diffusers: bool = True
-    ):
-        if torch.cuda.is_available() and "cuda" in str(device):
-            self.device = torch.device(device)
-            if self.device.index is not None:
-                torch.cuda.set_device(self.device.index)
-        else:
-            self.device = torch.device("cpu")
-
-        self.dtype = torch.float16 if use_fp16 and self.device.type == "cuda" else torch.float32
-        self.checkpoint = CHECKPOINT_ALIASES.get(checkpoint, checkpoint)
-        self.use_diffusers = use_diffusers
-        self.pipeline = None
-        self._init_pipeline()
-
-    def _init_pipeline(self):
-        print(f"\n[Marigold V1.1] 🚀 Loading '{self.checkpoint}' onto {self.device} (dtype: {self.dtype})...")
-        try:
-            from diffusers import MarigoldDepthPipeline
-            self.pipeline = MarigoldDepthPipeline.from_pretrained(
-                self.checkpoint,
-                torch_dtype=self.dtype
-            )
-            self.pipeline.to(self.device)
-            if hasattr(self.pipeline, "set_progress_bar_config"):
-                self.pipeline.set_progress_bar_config(disable=True)
-
-            if self.device.type == "cuda":
-                alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
-                res_mb = torch.cuda.memory_reserved(self.device) / (1024 ** 2)
-                print(f"[Marigold V1.1] ✅ Model active in VRAM on {self.device} (Allocated: {alloc_mb:.1f} MB | Reserved: {res_mb:.1f} MB)")
-            else:
-                print(f"[Marigold V1.1] ✅ Model loaded on CPU.")
-            return
-        except Exception as e:
-            print(f"[Marigold V1.1] Diffusers native load notice: {e}. Attempting diffusion pipeline auto-loader...")
-            try:
-                from diffusers import DiffusionPipeline
-                self.pipeline = DiffusionPipeline.from_pretrained(
-                    self.checkpoint,
-                    torch_dtype=self.dtype,
-                    custom_pipeline="marigold_depth_estimation"
-                )
-                self.pipeline.to(self.device)
-                if hasattr(self.pipeline, "set_progress_bar_config"):
-                    self.pipeline.set_progress_bar_config(disable=True)
-                if self.device.type == "cuda":
-                    alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
-                    print(f"[Marigold V1.1] ✅ Model active in VRAM on {self.device} ({alloc_mb:.1f} MB)")
-                return
-            except Exception as e2:
-                print(f"[Marigold V1.1] ❌ Fatal: Failed to load Marigold into VRAM: {e2}")
-                raise RuntimeError(f"Could not load Marigold checkpoint '{self.checkpoint}' on {self.device}: {e2}")
-
-    def predict_depth_batch(self, images_bgr: List[np.ndarray], batch_size: int = 4) -> List[np.ndarray]:
-        """
-        Runs batched Marigold depth estimation on perspective tiles on the GPU.
-        """
-        from PIL import Image
-        pil_images = [Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in images_bgr]
-
-        depths = []
-        num_steps = 1 if "lcm" in self.checkpoint.lower() else 4
-
-        for i in range(0, len(pil_images), batch_size):
-            batch = pil_images[i:i + batch_size]
-            try:
-                with torch.inference_mode():
-                    pipe_out = self.pipeline(
-                        batch,
-                        denoising_steps=num_steps,
-                        ensemble_size=1,
-                        output_type="np",
-                        show_progress_bar=False
-                    )
-                    prediction = pipe_out.prediction
-                    if prediction.ndim == 4:
-                        prediction = prediction.squeeze(1)
-                    for b_idx in range(len(batch)):
-                        depths.append(prediction[b_idx].astype(np.float32))
-            except Exception:
-                for b in batch:
-                    depths.append(self.predict_depth_tile(cv2.cvtColor(np.array(b), cv2.COLOR_RGB2BGR)))
-
-        return depths
-
-    def predict_depth_tile(self, image_bgr: np.ndarray) -> np.ndarray:
-        """
-        Runs Marigold depth estimation on a single perspective tile.
-        """
-        return self.predict_depth_batch([image_bgr], batch_size=1)[0]
+    quantization: str = "4bit",
+    use_fp16: bool = True
+) -> MarigoldV2InferenceEngine:
+    """
+    Creates and initializes the Marigold V2 DiT inference engine.
+    Checks local existence first, or downloads directly from Hugging Face Hub.
+    """
+    return MarigoldV2InferenceEngine(
+        checkpoint=checkpoint,
+        base_model=base_model,
+        modality=modality,
+        device=device,
+        quantization=quantization,
+        use_fp16=use_fp16
+    )
 
 
 def process_single_panorama(
-    engine: Union[MarigoldInferenceEngine, Any],
+    engine: MarigoldV2InferenceEngine,
     image_path: Union[str, Path],
     save_path: Union[str, Path],
     split_resolution: int = 512,
@@ -238,7 +113,7 @@ def process_single_panorama(
     save_debug: bool = False
 ) -> Dict[str, Any]:
     """
-    Processes a single 360 panorama image using an already-loaded in-memory MarigoldInferenceEngine.
+    Processes a single 360 panorama image using an in-memory Marigold V2 DiT engine.
     """
     image_path = Path(image_path)
     save_path = Path(save_path)
@@ -259,13 +134,13 @@ def process_single_panorama(
         target_width = min(resize_to, int(resize_to * orig_width / orig_height))
         image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
-    # 1. Split equirectangular panorama into perspective views using icosahedron
+    # 1. Split equirectangular panorama into 12 perspective views using icosahedron geometry
     t0 = time.time()
     splitted_extrinsics, splitted_intrinsics = get_panorama_cameras()
     splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intrinsics, split_resolution)
     t1 = time.time()
 
-    # 2. Batched GPU inference on 12 perspective views
+    # 2. Batched GPU inference on perspective views via Marigold V2 DiT
     splitted_images_bgr = [cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in splitted_images]
     splitted_depth_maps = engine.predict_depth_batch(splitted_images_bgr, batch_size=batch_size)
 
@@ -323,7 +198,7 @@ def process_single_panorama(
         with open(splitted_dir / 'cameras.json', 'w') as f:
             json.dump({'views': cameras_meta}, f, indent=2)
 
-    # 3. Merge panoramic depth using GPU Poisson solver (0% CPU lock, ~30ms runtime)
+    # 3. Merge panoramic depth using GPU Poisson solver (~4.6s on CUDA)
     t3 = time.time()
     merging_width, merging_height = min(1920, target_width), min(960, target_height)
     panorama_depth, panorama_mask = merge_panorama_depth(
@@ -377,27 +252,31 @@ def process_single_panorama(
     }
 
 
-@click.command(help='Standalone Marigold-360 Panorama Inference CLI (Docker / Direct CLI)')
-@click.option('--input', '-i', 'input_path', type=click.Path(exists=True), required=True, help='Input panorama image or folder path (JPG/PNG/WEBP). [REQUIRED via CLI]')
-@click.option('--output', '-o', 'output_path', type=click.Path(), envvar='MARIGOLD_OUTPUT', default='./output', show_default=True, help='Output directory for generated artifacts. [env: MARIGOLD_OUTPUT]')
-@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='huawei-bayerlab/marigold-v2-0', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
-@click.option('--device', 'device_name', type=str, envvar='MARIGOLD_DEVICE', default='cuda', show_default=True, help='Device (e.g. "cuda", "cuda:0", "cpu"). [env: MARIGOLD_DEVICE]')
-@click.option('--fp16', 'use_fp16', is_flag=True, envvar='MARIGOLD_FP16', default=True, help='Use FP16 precision for faster inference. [env: MARIGOLD_FP16]')
-@click.option('--diffusers', 'use_diffusers', is_flag=True, envvar='MARIGOLD_DIFFUSERS', default=True, help='Use Hugging Face Diffusers backend. [env: MARIGOLD_DIFFUSERS]')
-@click.option('--resize', 'resize_to', type=int, envvar='MARIGOLD_RESIZE', default=None, help='Max dimension ceiling (default: None = keep original resolution). [env: MARIGOLD_RESIZE]')
-@click.option('--split_resolution', type=int, envvar='MARIGOLD_SPLIT_RESOLUTION', default=512, show_default=True, help='Resolution for each splitted perspective view (512 or 1024). [env: MARIGOLD_SPLIT_RESOLUTION]')
+@click.command(help='🌸 Marigold V2 360° Panorama Inference CLI')
+@click.option('--input', '-i', 'input_path', type=click.Path(exists=True), required=True, help='Input panorama image or directory (JPG/PNG/WEBP). [REQUIRED]')
+@click.option('--output', '-o', 'output_path', type=click.Path(), envvar='MARIGOLD_OUTPUT', default='./output', show_default=True, help='Output directory for generated depth & artifacts. [env: MARIGOLD_OUTPUT]')
+@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='huawei-bayerlab/marigold-v2-0', show_default=True, help='Marigold V2 checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
+@click.option('--base_model', 'base_model', type=str, envvar='MARIGOLD_BASE_MODEL', default='Qwen/Qwen-Image-Edit-2509', show_default=True, help='Base Qwen DiT model repo or local directory. [env: MARIGOLD_BASE_MODEL]')
+@click.option('--modality', '-m', 'modality', type=click.Choice(['depth', 'normals', 'albedo']), default='depth', show_default=True, help='Estimation modality. [env: MARIGOLD_MODALITY]')
+@click.option('--quantization', '-q', 'quantization', type=click.Choice(['4bit', '8bit', 'none']), default='4bit', show_default=True, help='DiT quantization level. [env: MARIGOLD_QUANTIZATION]')
+@click.option('--device', 'device_name', type=str, envvar='MARIGOLD_DEVICE', default='cuda', show_default=True, help='Compute device ("cuda", "cuda:0", "cpu"). [env: MARIGOLD_DEVICE]')
+@click.option('--fp16', 'use_fp16', is_flag=True, envvar='MARIGOLD_FP16', default=True, help='Use FP16/BF16 precision. [env: MARIGOLD_FP16]')
+@click.option('--resize', 'resize_to', type=int, envvar='MARIGOLD_RESIZE', default=None, help='Max dimension ceiling (default: None = full resolution). [env: MARIGOLD_RESIZE]')
+@click.option('--split_resolution', type=int, envvar='MARIGOLD_SPLIT_RESOLUTION', default=512, show_default=True, help='Resolution for each perspective tile (512 or 1024). [env: MARIGOLD_SPLIT_RESOLUTION]')
 @click.option('--batch_size', type=int, envvar='MARIGOLD_BATCH_SIZE', default=1, show_default=True, help='Batch size for perspective view inference. [env: MARIGOLD_BATCH_SIZE]')
-@click.option('--debug', 'save_debug', is_flag=True, envvar='MARIGOLD_DEBUG', help='Save debug artifacts (splitted perspective views, distance maps, and camera JSON metadata). [env: MARIGOLD_DEBUG]')
-@click.option('--maps', 'save_maps_', is_flag=True, envvar='MARIGOLD_MAPS', help='Save visual maps and raw EXRs (depth.exr, depth_vis.png, mask.png). [env: MARIGOLD_MAPS]')
+@click.option('--debug', 'save_debug', is_flag=True, envvar='MARIGOLD_DEBUG', help='Save debug artifacts (tiles, distance maps, camera JSONs). [env: MARIGOLD_DEBUG]')
+@click.option('--maps', 'save_maps_', is_flag=True, envvar='MARIGOLD_MAPS', help='Save visual maps (depth.exr, depth_vis.png, mask.png). [env: MARIGOLD_MAPS]')
 @click.option('--depth_npy/--no-depth_npy', 'save_depth_npy', envvar='MARIGOLD_DEPTH_NPY', default=True, show_default=True, help='Save primary depth.npy float32 array. [env: MARIGOLD_DEPTH_NPY]')
 @click.option('--points_ply', 'save_points_ply', is_flag=True, envvar='MARIGOLD_POINTS_PLY', help='Save 3D point cloud in pointcloud.ply format. [env: MARIGOLD_POINTS_PLY]')
 def main(
     input_path: str,
     output_path: str,
     checkpoint_path: str,
+    base_model: str,
+    modality: str,
+    quantization: str,
     device_name: str,
     use_fp16: bool,
-    use_diffusers: bool,
     resize_to: Optional[int],
     split_resolution: int,
     batch_size: int,
@@ -407,7 +286,7 @@ def main(
     save_points_ply: bool
 ):
     """
-    Executes standalone Marigold 360 panorama inference CLI on single images or entire folders.
+    Executes Marigold V2 360° panorama inference on single images or entire folders.
     """
     input_p = Path(input_path)
     output_p = Path(output_path)
@@ -424,11 +303,14 @@ def main(
         raise FileNotFoundError(f"No valid panorama image files found at: {input_path}")
 
     print("=" * 70)
-    print(" 🌸 MARIGOLD 360° PANORAMA INFERENCE CLI")
+    print(" 🌸 MARIGOLD V2 360° PANORAMA INFERENCE CLI")
     print("=" * 70)
     print(f" Input:              {input_path} ({len(image_paths)} file{'s' if len(image_paths) > 1 else ''})")
     print(f" Output:             {output_path}")
     print(f" Checkpoint:         {checkpoint_path}")
+    print(f" Base Model:         {base_model}")
+    print(f" Modality:           {modality}")
+    print(f" Quantization:       {quantization}")
     print(f" Device:             {device_name} (FP16: {use_fp16})")
     print(f" Tile Resolution:    {split_resolution}x{split_resolution}")
     print(f" Batch Size:         {batch_size}")
@@ -436,12 +318,14 @@ def main(
     print(f" Debug Tiles:        {save_debug}")
     print("=" * 70 + "\n")
 
-    # Initialize Engine (Auto-routes between V2 DiT and V1.1 Diffusers)
+    # Initialize Marigold V2 DiT Engine
     engine = create_inference_engine(
         checkpoint=checkpoint_path,
+        base_model=base_model,
+        modality=modality,
         device=device_name,
-        use_fp16=use_fp16,
-        use_diffusers=use_diffusers
+        quantization=quantization,
+        use_fp16=use_fp16
     )
 
     for idx, image_path in enumerate(image_paths, start=1):
@@ -469,9 +353,8 @@ def main(
         except Exception as e:
             print(f"[{idx}/{len(image_paths)}] ❌ Failed {image_path.name}: {e}\n")
 
-    print("✨ All panoramas processed successfully!")
+    print("✨ All panoramas processed successfully with Marigold V2!")
 
 
 if __name__ == '__main__':
     main()
-

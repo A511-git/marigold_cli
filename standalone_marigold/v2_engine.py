@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 import cv2
 import numpy as np
 import torch
@@ -34,20 +34,28 @@ def _latent_stats(vae, ref):
 class MarigoldV2InferenceEngine:
     """
     Official Marigold V2 Diffusion Transformer (DiT) Inference Engine.
-    Powered by Qwen-Image-Edit-2509 DiT + Huawei Bayer Lab single-step flow matching LoRA weights.
+    Dynamically loads from local checkpoint folder if present, or downloads from Hugging Face Hub.
     """
     def __init__(
         self,
         checkpoint: str = "huawei-bayerlab/marigold-v2-0",
+        base_model: str = "Qwen/Qwen-Image-Edit-2509",
         modality: str = "depth",
         device: str = "cuda",
         quantization: str = "4bit",
         use_fp16: bool = True
     ):
-        self.device = torch.device(device if torch.cuda.is_available() and "cuda" in str(device) else "cpu")
+        if torch.cuda.is_available() and "cuda" in str(device):
+            self.device = torch.device(device)
+            if self.device.index is not None:
+                torch.cuda.set_device(self.device.index)
+        else:
+            self.device = torch.device("cpu")
+
         self.modality = modality.lower()
-        self.quantization = quantization
+        self.quantization = quantization.lower()
         self.checkpoint = checkpoint
+        self.base_model = base_model
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else (torch.float16 if use_fp16 else torch.float32)
 
         self.vae = None
@@ -57,29 +65,36 @@ class MarigoldV2InferenceEngine:
 
         self._load_models()
 
+    def _resolve_path_or_download(self, repo_or_path: str, allow_patterns: Optional[List[str]] = None) -> Path:
+        """
+        If repo_or_path exists locally on disk, returns the local Path directly.
+        Otherwise, downloads / resolves cache from HuggingFace Hub.
+        """
+        p = Path(repo_or_path)
+        if p.exists():
+            print(f"[Marigold V2] 📂 Found local model path: {p.resolve()}")
+            return p.resolve()
+
+        print(f"[Marigold V2] 🌐 Checking / Downloading model from Hugging Face Hub: '{repo_or_path}'...")
+        kwargs = {"repo_id": repo_or_path, "repo_type": "model"}
+        if allow_patterns:
+            kwargs["allow_patterns"] = allow_patterns
+        cached_dir = Path(snapshot_download(**kwargs))
+        print(f"[Marigold V2] 📥 Model cached at: {cached_dir}")
+        return cached_dir
+
     def _load_models(self):
-        print(f"\n[Marigold V2 DiT] 🚀 Loading Marigold V2 ({self.modality.upper()}) on {self.device} (dtype: {self.dtype}, quant: {self.quantization})...")
+        print(f"\n[Marigold V2] 🚀 Initializing Marigold V2 ({self.modality.upper()}) on {self.device} (dtype: {self.dtype}, quant: {self.quantization})...")
         
-        # 1. Resolve / Download base Qwen DiT and Marigold V2 LoRA checkpoints
-        qwen_repo = "Qwen/Qwen-Image-Edit-2509"
-        v2_repo = "huawei-bayerlab/marigold-v2-0"
-
-        # Check if local or download
-        if os.path.isdir(self.checkpoint):
-            v2_dir = Path(self.checkpoint)
-        else:
-            print(f"[Marigold V2 DiT] 📥 Ensuring Marigold V2 weights are cached from {v2_repo}...")
-            v2_dir = Path(snapshot_download(repo_id=v2_repo, repo_type="model"))
-
-        print(f"[Marigold V2 DiT] 📥 Ensuring Qwen base model is cached from {qwen_repo}...")
-        qwen_dir = Path(snapshot_download(
-            repo_id=qwen_repo,
-            repo_type="model",
+        # 1. Resolve Marigold V2 LoRA checkpoint and Qwen base model
+        v2_dir = self._resolve_path_or_download(self.checkpoint)
+        qwen_dir = self._resolve_path_or_download(
+            self.base_model,
             allow_patterns=["vae/*", "transformer/*", "model_index.json", "scheduler/*"]
-        ))
+        )
 
         # 2. Load VAE
-        print(f"[Marigold V2 DiT] 🧠 Loading Qwen VAE...")
+        print(f"[Marigold V2] 🧠 Loading Qwen VAE from {qwen_dir / 'vae'}...")
         self.vae = AutoencoderKLQwenImage.from_pretrained(
             qwen_dir / "vae",
             torch_dtype=self.dtype,
@@ -88,8 +103,8 @@ class MarigoldV2InferenceEngine:
         ).to(self.device).eval()
         self.vae.requires_grad_(False)
 
-        # 3. Load DiT Transformer with 4-bit / 8-bit / bf16
-        print(f"[Marigold V2 DiT] 🧠 Loading Qwen DiT Transformer (quant: {self.quantization})...")
+        # 3. Load DiT Transformer with requested quantization (4-bit / 8-bit / full precision)
+        print(f"[Marigold V2] 🧠 Loading Qwen DiT Transformer (quantization: {self.quantization})...")
         quant_config = None
         if self.quantization == "4bit" and self.device.type == "cuda":
             quant_config = DiffusersBitsAndBytesConfig(
@@ -115,14 +130,22 @@ class MarigoldV2InferenceEngine:
         # 4. Load Marigold V2 LoRA & VAE trainables
         modality_subdirs = {
             "depth": "depth/Log-stage2",
+            "depth-stage1": "depth/Log",
             "normals": "normals",
             "albedo": "albedo"
         }
         sub = modality_subdirs.get(self.modality, "depth/Log-stage2")
-        trainables_path = v2_dir / sub / "trainables.safetensors"
         
-        if trainables_path.is_file():
-            print(f"[Marigold V2 DiT] 🎯 Loading LoRA weights from {trainables_path.name}...")
+        # Check potential trainable weight locations
+        trainables_candidates = [
+            v2_dir / sub / "trainables.safetensors",
+            v2_dir / "trainables.safetensors",
+            v2_dir / f"{self.modality}_trainables.safetensors"
+        ]
+        trainables_path = next((c for c in trainables_candidates if c.is_file()), None)
+
+        if trainables_path is not None:
+            print(f"[Marigold V2] 🎯 Injecting LoRA weights from {trainables_path}...")
             state_dict = load_file(str(trainables_path), device="cpu")
             
             # Load VAE weights if present
@@ -135,8 +158,10 @@ class MarigoldV2InferenceEngine:
             if transformer_state:
                 try:
                     self.transformer.load_state_dict(transformer_state, strict=False)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[Marigold V2] Transformer partial weight load notice: {e}")
+        else:
+            print(f"[Marigold V2] ⚠️ No specific trainables.safetensors found in {v2_dir / sub}; using base DiT.")
 
         if quant_config is None:
             self.transformer.to(self.device)
@@ -146,11 +171,12 @@ class MarigoldV2InferenceEngine:
         # 5. Load precomputed prompt embeddings
         prefix_map = {
             "depth": "qwen_edit_2509_qwen_depth_realimg512",
+            "depth-stage1": "qwen_edit_2509_qwen_depth_realimg512",
             "normals": "qwen_edit_2509_qwen_normals_dummy512",
             "albedo": "qwen_edit_2509_qwen_albedo_rgb_dummy512"
         }
         p_prefix = prefix_map.get(self.modality, prefix_map["depth"])
-        embeds_dir = v2_dir / "qwen_text_embeddings"
+        embeds_dir = v2_dir / "qwen_text_embeddings" if (v2_dir / "qwen_text_embeddings").is_dir() else v2_dir
         
         embeds_file = embeds_dir / f"{p_prefix}_prompt_embeds.pt"
         mask_file = embeds_dir / f"{p_prefix}_prompt_mask.pt"
@@ -160,9 +186,13 @@ class MarigoldV2InferenceEngine:
             self.prompt_mask = torch.load(str(mask_file), map_location="cpu", weights_only=False)
             if self.prompt_mask.dtype != torch.bool:
                 self.prompt_mask = self.prompt_mask > 0
+        else:
+            # Fallback zero/dummy prompt if not provided in weights
+            self.prompt_embeds = torch.zeros((1, 77, 4096), dtype=self.dtype)
+            self.prompt_mask = torch.ones((1, 77), dtype=torch.bool)
 
         alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2) if self.device.type == "cuda" else 0
-        print(f"[Marigold V2 DiT] ✅ Marigold V2 ready in VRAM ({alloc_mb:.1f} MB allocated). Single-step flow matching ready.")
+        print(f"[Marigold V2] ✅ Marigold V2 ready in VRAM ({alloc_mb:.1f} MB allocated). Single-step flow matching ready.\n")
 
     @torch.no_grad()
     def predict_depth_batch(self, images_bgr: List[np.ndarray], batch_size: int = 1) -> List[np.ndarray]:
@@ -233,3 +263,9 @@ class MarigoldV2InferenceEngine:
                 depths.append(d)
 
         return depths
+
+    def predict_depth_tile(self, image_bgr: np.ndarray) -> np.ndarray:
+        """
+        Runs Marigold depth estimation on a single perspective tile.
+        """
+        return self.predict_depth_batch([image_bgr], batch_size=1)[0]
