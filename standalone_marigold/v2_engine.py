@@ -277,10 +277,10 @@ class MarigoldV2InferenceEngine:
         alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2) if self.device.type == "cuda" else 0
         print(f"[Marigold V2] ✅ Marigold V2 ready in VRAM ({alloc_mb:.1f} MB allocated). Single-step flow matching ready.\n")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_depth_batch(self, images_bgr: List[np.ndarray], batch_size: int = 1) -> List[np.ndarray]:
         """
-        Executes single-step Marigold V2 DiT flow-matching depth estimation on a batch of images.
+        Executes single-step Marigold V2 DiT flow-matching depth estimation on a batch of images with strict VRAM management.
         """
         depths = []
         for i in range(0, len(images_bgr), batch_size):
@@ -302,6 +302,9 @@ class MarigoldV2InferenceEngine:
             latents = self.vae.encode(inp.unsqueeze(2)).latent_dist.sample()
             mean, std_inv = _latent_stats(self.vae, latents)
             lat = ((latents - mean) * std_inv)[:, :, 0]
+            del inp, latents
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             # 2. Pack latents
             packed = QwenImageEditPipeline._pack_latents(
@@ -324,20 +327,29 @@ class MarigoldV2InferenceEngine:
                 txt_seq_lens=txt_seq_lens,
                 return_dict=False
             )[0]
+            del packed, p_embeds, p_mask
 
             # 4. Integrate flow step (t -> 0)
             unpacked_v = QwenImageEditPipeline._unpack_latents(
                 velocity, height=lat.shape[2] * 8, width=lat.shape[3] * 8, vae_scale_factor=8
             )
             lat_out = lat - (timestep[0] * unpacked_v)
+            del velocity, unpacked_v, lat
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             # 5. VAE Decode
             lat_out_5d = lat_out.unsqueeze(2)
             lat_out_unnorm = lat_out_5d / std_inv + mean
+            del lat_out, lat_out_5d
             decoded = self.vae.decode(lat_out_unnorm).sample[:, :, 0]
+            del lat_out_unnorm, mean, std_inv
 
             # 6. Extract depth map (average over 3 channels, exponentiate for metric depth)
             pred = decoded.mean(dim=1).float().cpu().numpy()
+            del decoded
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             for b in range(B):
                 d = pred[b]

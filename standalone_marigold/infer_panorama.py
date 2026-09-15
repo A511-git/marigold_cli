@@ -8,6 +8,7 @@ import os
 if os.environ.get('MPLBACKEND', '').startswith('module://'):
     os.environ['MPLBACKEND'] = 'Agg'
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import sys
 from pathlib import Path
