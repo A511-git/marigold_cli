@@ -75,69 +75,118 @@ except ImportError:
         )
 
 
+CHECKPOINT_ALIASES = {
+    "huawei-bayerlab/marigold-v2-0": "prs-eth/marigold-v2-0",
+    "marigold-v2-0": "prs-eth/marigold-v2-0",
+    "marigold-v2": "prs-eth/marigold-v2-0",
+    "marigold-depth-v1-1": "prs-eth/marigold-depth-v1-1",
+    "marigold-lcm": "prs-eth/marigold-depth-lcm-v1-0",
+    "marigold-depth-lcm": "prs-eth/marigold-depth-lcm-v1-0",
+}
+
+
 class MarigoldInferenceEngine:
-    """Loads and manages Marigold V2 DiT and diffusers pipelines."""
+    """Loads and manages official Marigold V2 diffusion depth model on GPU."""
     def __init__(
         self,
-        checkpoint: str = "huawei-bayerlab/marigold-v2-0",
+        checkpoint: str = "prs-eth/marigold-v2-0",
         device: str = "cuda",
         use_fp16: bool = True,
-        use_diffusers: bool = False
+        use_diffusers: bool = True
     ):
-        self.device = torch.device(device if torch.cuda.is_available() and "cuda" in device else "cpu")
+        if torch.cuda.is_available() and "cuda" in str(device):
+            self.device = torch.device(device)
+            torch.cuda.set_device(self.device)
+        else:
+            self.device = torch.device("cpu")
+
         self.dtype = torch.float16 if use_fp16 and self.device.type == "cuda" else torch.float32
-        self.checkpoint = checkpoint
+        self.checkpoint = CHECKPOINT_ALIASES.get(checkpoint, checkpoint)
         self.use_diffusers = use_diffusers
         self.pipeline = None
         self._init_pipeline()
 
     def _init_pipeline(self):
-        if self.use_diffusers:
-            try:
-                from diffusers import MarigoldDepthPipeline
-                print(f"[Marigold] Loading diffusers pipeline: {self.checkpoint}")
-                self.pipeline = MarigoldDepthPipeline.from_pretrained(
-                    self.checkpoint,
-                    torch_dtype=self.dtype
-                ).to(self.device)
-                return
-            except Exception as e:
-                print(f"[Marigold] Diffusers load warning: {e}. Trying standard model load...")
+        print(f"\n[Marigold V2] 🚀 Loading '{self.checkpoint}' onto {self.device} (dtype: {self.dtype})...")
+        try:
+            from diffusers import MarigoldDepthPipeline
+            self.pipeline = MarigoldDepthPipeline.from_pretrained(
+                self.checkpoint,
+                torch_dtype=self.dtype
+            )
+            self.pipeline.to(self.device)
+            if hasattr(self.pipeline, "set_progress_bar_config"):
+                self.pipeline.set_progress_bar_config(disable=True)
 
-        # Marigold native loader check
-        print(f"[Marigold] Initialized inference engine on {self.device} (dtype: {self.dtype}).")
+            if self.device.type == "cuda":
+                alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+                res_mb = torch.cuda.memory_reserved(self.device) / (1024 ** 2)
+                print(f"[Marigold V2] ✅ Model active in VRAM on {self.device} (Allocated: {alloc_mb:.1f} MB | Reserved: {res_mb:.1f} MB)")
+            else:
+                print(f"[Marigold V2] ✅ Model loaded on CPU.")
+            return
+        except Exception as e:
+            print(f"[Marigold V2] Diffusers native load notice: {e}. Attempting diffusion pipeline auto-loader...")
+            try:
+                from diffusers import DiffusionPipeline
+                self.pipeline = DiffusionPipeline.from_pretrained(
+                    self.checkpoint,
+                    torch_dtype=self.dtype,
+                    custom_pipeline="marigold_depth_estimation"
+                )
+                self.pipeline.to(self.device)
+                if hasattr(self.pipeline, "set_progress_bar_config"):
+                    self.pipeline.set_progress_bar_config(disable=True)
+                if self.device.type == "cuda":
+                    alloc_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+                    print(f"[Marigold V2] ✅ Model active in VRAM on {self.device} ({alloc_mb:.1f} MB)")
+                return
+            except Exception as e2:
+                print(f"[Marigold V2] ❌ Fatal: Failed to load Marigold V2 into VRAM: {e2}")
+                raise RuntimeError(f"Could not load Marigold V2 checkpoint '{self.checkpoint}' on {self.device}: {e2}")
 
     def predict_depth_tile(self, image_bgr: np.ndarray) -> np.ndarray:
         """
-        Runs Marigold depth estimation on a single perspective tile.
+        Runs Marigold V2 depth estimation on a single perspective tile.
         Returns:
             2D numpy array [H, W] float32 relative depth.
         """
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        h, w = image_rgb.shape[:2]
+        from PIL import Image
+        pil_img = Image.fromarray(image_rgb)
 
-        if self.pipeline is not None and hasattr(self.pipeline, "__call__"):
-            from PIL import Image
-            pil_img = Image.fromarray(image_rgb)
+        if self.pipeline is not None:
+            # 4 steps for optimal Marigold V2 quality, 1 step for LCM
+            num_steps = 1 if "lcm" in self.checkpoint.lower() else 4
             with torch.inference_mode():
-                out = self.pipeline(pil_img, num_inference_steps=1)
-            if hasattr(out, "depth_np"):
-                return out.depth_np.astype(np.float32)
-            elif hasattr(out, "prediction"):
-                return out.prediction[0].cpu().numpy().astype(np.float32)
+                out = self.pipeline(
+                    pil_img,
+                    num_inference_steps=num_steps,
+                    ensemble_size=1
+                )
 
-        # Gradient fallback for test/dry-run environments
-        u, v = np.meshgrid(np.linspace(-1, 1, w), np.linspace(-1, 1, h))
-        return (1.0 + 0.4 * (u**2 + v**2)).astype(np.float32)
+            if hasattr(out, "depth_np"):
+                return out.depth_np.squeeze().astype(np.float32)
+            elif hasattr(out, "prediction"):
+                pred = out.prediction
+                if isinstance(pred, torch.Tensor):
+                    return pred.squeeze().cpu().numpy().astype(np.float32)
+                return np.array(pred).squeeze().astype(np.float32)
+            elif hasattr(out, "depth_16bit"):
+                return (out.depth_16bit.squeeze().astype(np.float32) / 65535.0)
+            elif isinstance(out, (list, tuple)):
+                return np.array(out[0]).squeeze().astype(np.float32)
+
+        raise RuntimeError("Marigold V2 pipeline is not loaded on GPU!")
 
 
 @click.command(help='Standalone Marigold-360 Panorama Inference CLI (Docker / Direct CLI)')
 @click.option('--input', '-i', 'input_path', type=click.Path(exists=True), required=True, help='Input panorama image or folder path (JPG/PNG/WEBP). [REQUIRED via CLI]')
 @click.option('--output', '-o', 'output_path', type=click.Path(), envvar='MARIGOLD_OUTPUT', default='./output', show_default=True, help='Output directory for generated artifacts. [env: MARIGOLD_OUTPUT]')
-@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='huawei-bayerlab/marigold-v2-0', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
+@click.option('--checkpoint', '-c', 'checkpoint_path', type=str, envvar='MARIGOLD_CHECKPOINT', default='prs-eth/marigold-v2-0', show_default=True, help='Marigold checkpoint path or HuggingFace repo. [env: MARIGOLD_CHECKPOINT]')
 @click.option('--device', 'device_name', type=str, envvar='MARIGOLD_DEVICE', default='cuda', show_default=True, help='Device (e.g. "cuda", "cuda:0", "cpu"). [env: MARIGOLD_DEVICE]')
-@click.option('--fp16', 'use_fp16', is_flag=True, envvar='MARIGOLD_FP16', help='Use FP16 precision for faster inference. [env: MARIGOLD_FP16]')
-@click.option('--diffusers', 'use_diffusers', is_flag=True, envvar='MARIGOLD_DIFFUSERS', help='Use Hugging Face Diffusers backend. [env: MARIGOLD_DIFFUSERS]')
+@click.option('--fp16', 'use_fp16', is_flag=True, envvar='MARIGOLD_FP16', default=True, help='Use FP16 precision for faster inference. [env: MARIGOLD_FP16]')
+@click.option('--diffusers', 'use_diffusers', is_flag=True, envvar='MARIGOLD_DIFFUSERS', default=True, help='Use Hugging Face Diffusers backend. [env: MARIGOLD_DIFFUSERS]')
 @click.option('--resize', 'resize_to', type=int, envvar='MARIGOLD_RESIZE', default=None, help='Max dimension ceiling (default: None = keep original resolution). [env: MARIGOLD_RESIZE]')
 @click.option('--split_resolution', type=int, envvar='MARIGOLD_SPLIT_RESOLUTION', default=512, show_default=True, help='Resolution for each splitted perspective view (512 or 1024). [env: MARIGOLD_SPLIT_RESOLUTION]')
 @click.option('--batch_size', type=int, envvar='MARIGOLD_BATCH_SIZE', default=1, show_default=True, help='Batch size for perspective view inference. [env: MARIGOLD_BATCH_SIZE]')

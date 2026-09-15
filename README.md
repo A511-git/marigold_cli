@@ -92,7 +92,7 @@ All options can be configured via **CLI flags**, **Docker environment variables 
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `--input` | `-i` | *None (CLI Required)* | `Path` | **Mandatory** | Input panorama image or folder path (JPG, PNG, WEBP). |
 | `--output` | `-o` | `MARIGOLD_OUTPUT` | `Path` | `./output` | Output destination directory. |
-| `--checkpoint` | `-c` | `MARIGOLD_CHECKPOINT` | `String` | `huawei-bayerlab/marigold-v2-0` | Marigold checkpoint path or HuggingFace repo. |
+| `--checkpoint` | `-c` | `MARIGOLD_CHECKPOINT` | `String` | `prs-eth/marigold-v2-0` | Marigold checkpoint path or HuggingFace repo. |
 | `--device` | | `MARIGOLD_DEVICE` | `String` | `cuda` | Execution device (`cuda`, `cuda:0`, `cpu`). |
 | `--fp16` | | `MARIGOLD_FP16` | `Flag` | `False` | Enables FP16 half precision for faster inference. |
 | `--diffusers` | | `MARIGOLD_DIFFUSERS` | `Flag` | `False` | Uses HuggingFace Diffusers Marigold pipeline backend. |
