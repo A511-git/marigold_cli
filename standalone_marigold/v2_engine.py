@@ -55,9 +55,9 @@ class MarigoldV2InferenceEngine:
 
         self.modality = modality.lower()
         self.quantization = quantization.lower()
-        self.checkpoint = checkpoint
-        self.base_model = base_model
-        self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else (torch.float16 if use_fp16 else torch.float32)
+        self.dtype = torch.float16 if use_fp16 else torch.float32
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self.vae = None
         self.transformer = None
