@@ -55,9 +55,9 @@ class MarigoldV2InferenceEngine:
 
         self.modality = modality.lower()
         self.quantization = quantization.lower()
-        self.dtype = torch.float16 if use_fp16 else torch.float32
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.checkpoint = checkpoint
+        self.base_model = base_model
+        self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else (torch.float16 if use_fp16 else torch.float32)
 
         self.vae = None
         self.transformer = None
@@ -93,6 +93,8 @@ class MarigoldV2InferenceEngine:
         return cached_dir
 
     def _load_models(self):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(f"\n[Marigold V2] 🚀 Initializing Marigold V2 ({self.modality.upper()}) on {self.device} (dtype: {self.dtype}, quant: {self.quantization})...")
         
         # 1. Resolve targeted Marigold V2 LoRA subfolder for current modality (3 files only)
