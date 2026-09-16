@@ -48,3 +48,7 @@ desktop.ini
 *.log
 *.tmp
 Moge_CLI/
+.Reffrences/
+Reffrences/MoGe/
+Reffrences/MoGe_CLI/
+Reffrences/marigold-v2/

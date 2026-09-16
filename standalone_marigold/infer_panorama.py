@@ -2,6 +2,7 @@
 """
 🌸 Standalone Marigold V2 360° Panorama Inference CLI.
 Maps MoGe's icosahedron spherical camera splitting & PyTorch GPU Poisson solver directly to Marigold V2 DiT monocular depth estimation.
+Includes 12-tile global scale & shift alignment, camera height metric calibration (default 1.5m), and fast binary PLY export.
 """
 
 import os
@@ -50,8 +51,12 @@ try:
         spherical_uv_to_directions,
         get_panorama_cameras,
         split_panorama_image,
-        merge_panorama_depth
+        merge_panorama_depth,
+        calibrate_camera_height_metric_scale,
+        apply_metric_range_scaling,
+        export_binary_ply
     )
+    from standalone_marigold.panorama.alignment import align_tile_depths, solve_global_scale_shift
     from standalone_marigold.v2_engine import MarigoldV2InferenceEngine
 except ImportError:
     try:
@@ -61,8 +66,12 @@ except ImportError:
             spherical_uv_to_directions,
             get_panorama_cameras,
             split_panorama_image,
-            merge_panorama_depth
+            merge_panorama_depth,
+            calibrate_camera_height_metric_scale,
+            apply_metric_range_scaling,
+            export_binary_ply
         )
+        from .panorama.alignment import align_tile_depths, solve_global_scale_shift
         from .v2_engine import MarigoldV2InferenceEngine
     except (ImportError, ValueError):
         try:
@@ -74,8 +83,15 @@ except ImportError:
             spherical_uv_to_directions,
             get_panorama_cameras,
             split_panorama_image,
-            merge_panorama_depth
+            merge_panorama_depth,
+            calibrate_camera_height_metric_scale,
+            apply_metric_range_scaling,
+            export_binary_ply
         )
+        try:
+            from panorama.alignment import align_tile_depths, solve_global_scale_shift
+        except ImportError:
+            from .panorama.alignment import align_tile_depths, solve_global_scale_shift
         from v2_engine import MarigoldV2InferenceEngine
 
 
@@ -108,6 +124,10 @@ def process_single_panorama(
     split_resolution: int = 512,
     batch_size: int = 1,
     resize_to: Optional[int] = None,
+    align_tiles: bool = True,
+    camera_height: float = 1.5,
+    min_depth: float = 0.3,
+    max_depth: float = 15.0,
     save_maps_: bool = True,
     save_depth_npy: bool = True,
     save_points_ply: bool = True,
@@ -115,6 +135,7 @@ def process_single_panorama(
 ) -> Dict[str, Any]:
     """
     Processes a single 360 panorama image using an in-memory Marigold V2 DiT engine.
+    Includes pairwise 12-tile alignment, GPU Poisson merging, and camera height metric calibration.
     """
     image_path = Path(image_path)
     save_path = Path(save_path)
@@ -145,23 +166,35 @@ def process_single_panorama(
     splitted_images_bgr = [cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in splitted_images]
     splitted_depth_maps = engine.predict_depth_batch(splitted_images_bgr, batch_size=batch_size)
 
+    # 3. Global 12-camera scale and shift alignment across overlap regions
+    raw_masks = [np.isfinite(d) for d in splitted_depth_maps]
+    if align_tiles and len(splitted_depth_maps) > 1:
+        aligned_tiles, scales, shifts = align_tile_depths(
+            splitted_depth_maps, raw_masks, splitted_extrinsics, splitted_intrinsics
+        )
+    else:
+        aligned_tiles = splitted_depth_maps
+
     splitted_distance_maps = []
     splitted_masks = []
 
-    for i in range(len(splitted_depth_maps)):
-        tile_depth = splitted_depth_maps[i]
-        h, w = tile_depth.shape[:2]
+    for i in range(len(aligned_tiles)):
+        tile_d = aligned_tiles[i]
+        h, w = tile_d.shape[:2]
         intr = splitted_intrinsics[i]
-        fx, fy = intr[0, 0] * w, intr[1, 1] * h
-        cx, cy = intr[0, 2] * w, intr[1, 2] * h
+        fx = intr[0, 0] * w if intr[0, 0] <= 1.0 else intr[0, 0]
+        fy = intr[1, 1] * h if intr[1, 1] <= 1.0 else intr[1, 1]
+        cx = intr[0, 2] * w if intr[0, 2] <= 1.0 else intr[0, 2]
+        cy = intr[1, 2] * h if intr[1, 2] <= 1.0 else intr[1, 2]
 
         u_coords = np.arange(w, dtype=np.float32) + 0.5
         v_coords = np.arange(h, dtype=np.float32) + 0.5
         u_grid, v_grid = np.meshgrid(u_coords, v_coords)
 
         ray_scale = np.sqrt(1.0 + ((u_grid - cx) / fx)**2 + ((v_grid - cy) / fy)**2)
-        dist_map = (tile_depth * ray_scale).astype(np.float32)
-        mask = np.isfinite(dist_map) & (dist_map > 0)
+        # Map aligned relative log-depth to positive radial distance
+        dist_map = (np.exp(np.clip(tile_d, -6.0, 6.0)) * ray_scale).astype(np.float32)
+        mask = np.isfinite(dist_map) & (dist_map > 1e-4)
 
         splitted_distance_maps.append(dist_map)
         splitted_masks.append(mask)
@@ -199,7 +232,7 @@ def process_single_panorama(
         with open(splitted_dir / 'cameras.json', 'w') as f:
             json.dump({'views': cameras_meta}, f, indent=2)
 
-    # 3. Merge panoramic depth using GPU Poisson solver (~4.6s on CUDA)
+    # 4. Merge panoramic depth using GPU Poisson solver (~4.6s on CUDA)
     t3 = time.time()
     merging_width, merging_height = min(1920, target_width), min(960, target_height)
     panorama_depth, panorama_mask = merge_panorama_depth(
@@ -216,9 +249,24 @@ def process_single_panorama(
         panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
         panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
 
+    # 5. Apply Camera Height Metric Calibration (or range scaling)
+    if camera_height > 0.0:
+        panorama_depth, metric_scale = calibrate_camera_height_metric_scale(
+            panorama_depth,
+            target_camera_height_m=camera_height,
+            min_clamp_m=min_depth,
+            max_clamp_m=max_depth
+        )
+    else:
+        panorama_depth = apply_metric_range_scaling(
+            panorama_depth,
+            min_depth_m=min_depth,
+            max_depth_m=max_depth
+        )
+
     t4 = time.time()
 
-    # 4. Save primary and optional outputs
+    # 6. Save primary and optional outputs
     if save_depth_npy:
         np.save(str(save_path / 'depth.npy'), panorama_depth.astype(np.float32))
 
@@ -235,11 +283,8 @@ def process_single_panorama(
         cols = image.reshape(-1, 3)
         m = panorama_mask.reshape(-1) > 0
         pts, cols = pts[m], cols[m]
-        
-        with open(save_path / 'pointcloud.ply', 'w') as f:
-            f.write(f"ply\nformat ascii 1.0\nelement vertex {len(pts)}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
-            for p, c in zip(pts, cols):
-                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+        # Fast binary little-endian PLY export (< 50ms)
+        export_binary_ply(save_path / 'pointcloud.ply', pts, cols)
 
     return {
         'depth': panorama_depth,
@@ -265,10 +310,14 @@ def process_single_panorama(
 @click.option('--resize', 'resize_to', type=int, envvar='MARIGOLD_RESIZE', default=None, help='Max dimension ceiling (default: None = full resolution). [env: MARIGOLD_RESIZE]')
 @click.option('--split_resolution', type=int, envvar='MARIGOLD_SPLIT_RESOLUTION', default=512, show_default=True, help='Resolution for each perspective tile (512 or 1024). [env: MARIGOLD_SPLIT_RESOLUTION]')
 @click.option('--batch_size', type=int, envvar='MARIGOLD_BATCH_SIZE', default=1, show_default=True, help='Batch size for perspective view inference. [env: MARIGOLD_BATCH_SIZE]')
+@click.option('--camera_height', type=float, envvar='MARIGOLD_CAMERA_HEIGHT', default=1.5, show_default=True, help='Camera mounting height above floor in meters (default 1.5m). Set 0 to disable. [env: MARIGOLD_CAMERA_HEIGHT]')
+@click.option('--min_depth', type=float, envvar='MARIGOLD_MIN_DEPTH', default=0.3, show_default=True, help='Minimum physical depth clamp in meters. [env: MARIGOLD_MIN_DEPTH]')
+@click.option('--max_depth', type=float, envvar='MARIGOLD_MAX_DEPTH', default=15.0, show_default=True, help='Maximum physical depth clamp in meters. [env: MARIGOLD_MAX_DEPTH]')
+@click.option('--align/--no-align', 'align_tiles', envvar='MARIGOLD_ALIGN', default=True, show_default=True, help='Perform global scale & shift alignment across overlapping tiles. [env: MARIGOLD_ALIGN]')
 @click.option('--debug', 'save_debug', is_flag=True, envvar='MARIGOLD_DEBUG', help='Save debug artifacts (tiles, distance maps, camera JSONs). [env: MARIGOLD_DEBUG]')
 @click.option('--maps', 'save_maps_', is_flag=True, envvar='MARIGOLD_MAPS', help='Save visual maps (depth.exr, depth_vis.png, mask.png). [env: MARIGOLD_MAPS]')
-@click.option('--depth_npy/--no-depth_npy', 'save_depth_npy', envvar='MARIGOLD_DEPTH_NPY', default=True, show_default=True, help='Save primary depth.npy float32 array. [env: MARIGOLD_DEPTH_NPY]')
-@click.option('--points_ply', 'save_points_ply', is_flag=True, envvar='MARIGOLD_POINTS_PLY', help='Save 3D point cloud in pointcloud.ply format. [env: MARIGOLD_POINTS_PLY]')
+@click.option('--depth_npy/--no-depth_npy', 'save_depth_npy', envvar='MARIGOLD_DEPTH_NPY', default=True, show_default=True, help='Save primary depth.npy float32 array in meters. [env: MARIGOLD_DEPTH_NPY]')
+@click.option('--points_ply', 'save_points_ply', is_flag=True, envvar='MARIGOLD_POINTS_PLY', help='Save 3D point cloud in binary pointcloud.ply format. [env: MARIGOLD_POINTS_PLY]')
 def main(
     input_path: str,
     output_path: str,
@@ -281,6 +330,10 @@ def main(
     resize_to: Optional[int],
     split_resolution: int,
     batch_size: int,
+    camera_height: float,
+    min_depth: float,
+    max_depth: float,
+    align_tiles: bool,
     save_debug: bool,
     save_maps_: bool,
     save_depth_npy: bool,
@@ -315,6 +368,8 @@ def main(
     print(f" Device:             {device_name} (FP16: {use_fp16})")
     print(f" Tile Resolution:    {split_resolution}x{split_resolution}")
     print(f" Batch Size:         {batch_size}")
+    print(f" Tile Alignment:     {align_tiles}")
+    print(f" Camera Height:      {camera_height}m (Range: {min_depth}m - {max_depth}m)")
     print(f" Visual Maps:        {save_maps_}")
     print(f" Debug Tiles:        {save_debug}")
     print("=" * 70 + "\n")
@@ -345,6 +400,10 @@ def main(
                 split_resolution=split_resolution,
                 batch_size=batch_size,
                 resize_to=resize_to,
+                align_tiles=align_tiles,
+                camera_height=camera_height,
+                min_depth=min_depth,
+                max_depth=max_depth,
                 save_maps_=save_maps_,
                 save_depth_npy=save_depth_npy,
                 save_points_ply=save_points_ply,

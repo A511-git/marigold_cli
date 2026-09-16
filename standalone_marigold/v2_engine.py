@@ -378,16 +378,14 @@ class MarigoldV2InferenceEngine:
             decoded = self.vae.decode(lat_out_unnorm).sample[:, :, 0]
             del lat_out_unnorm, mean, std_inv
 
-            # 6. Extract depth map (average over 3 channels, exponentiate for metric depth)
+            # 6. Extract raw affine log-depth map (average over 3 channels)
             pred = decoded.mean(dim=1).float().cpu().numpy()
             del decoded
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
             for b in range(B):
-                d = pred[b]
-                # Map disparity/log-depth to positive relative distance
-                d = np.exp(np.clip(d, -5.0, 5.0))
+                d = pred[b].astype(np.float32)
                 depths.append(d)
 
         return depths
